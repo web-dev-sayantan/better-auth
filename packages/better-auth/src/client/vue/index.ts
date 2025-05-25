@@ -7,13 +7,16 @@ import type {
 	ClientOptions,
 	InferActions,
 	InferClientAPI,
-	InferSessionFromClient,
-	InferUserFromClient,
+	InferErrorCodes,
 	IsSignal,
 } from "../types";
 import { createDynamicPathProxy } from "../proxy";
-import type { UnionToIntersection } from "../../types/helper";
-import type { BetterFetchError } from "@better-fetch/fetch";
+import type { PrettifyDeep, UnionToIntersection } from "../../types/helper";
+import type {
+	BetterFetchError,
+	BetterFetchResponse,
+} from "@better-fetch/fetch";
+import type { BASE_ERROR_CODES } from "../../error/codes";
 
 function getAtomKey(str: string) {
 	return `use${capitalizeFirstLetter(str)}`;
@@ -55,14 +58,20 @@ export function createAuthClient<Option extends ClientOptions>(
 		resolvedHooks[getAtomKey(key)] = () => useStore(value);
 	}
 
-	type Session = {
-		session: InferSessionFromClient<Option>;
-		user: InferUserFromClient<Option>;
-	};
+	type ClientAPI = InferClientAPI<Option>;
+	type Session = ClientAPI extends {
+		getSession: () => Promise<infer Res>;
+	}
+		? Res extends BetterFetchResponse<infer S>
+			? S
+			: Res extends Record<string, any>
+				? Res
+				: never
+		: never;
 
-	function useSession(): () => DeepReadonly<
+	function useSession(): DeepReadonly<
 		Ref<{
-			data: Session | null;
+			data: Session;
 			isPending: boolean;
 			isRefetching: boolean;
 			error: BetterFetchError | null;
@@ -85,7 +94,9 @@ export function createAuthClient<Option extends ClientOptions>(
 		if (useFetch) {
 			const ref = useStore(pluginsAtoms.$sessionSignal);
 			const baseURL = options?.fetchOptions?.baseURL || options?.baseURL;
-			const authPath = baseURL ? new URL(baseURL).pathname : "/api/auth";
+			let authPath = baseURL ? new URL(baseURL).pathname : "/api/auth";
+			authPath = authPath === "/" ? "/api/auth" : authPath; //fix for root path
+			authPath = authPath.endsWith("/") ? authPath.slice(0, -1) : authPath; //fix for trailing slash
 			return useFetch(`${authPath}/get-session`, {
 				ref,
 			}).then((res: any) => {
@@ -114,14 +125,21 @@ export function createAuthClient<Option extends ClientOptions>(
 		pluginsAtoms,
 		atomListeners,
 	);
+
 	return proxy as UnionToIntersection<InferResolvedHooks<Option>> &
 		InferClientAPI<Option> &
 		InferActions<Option> & {
 			useSession: typeof useSession;
 			$Infer: {
-				Session: Session;
+				Session: NonNullable<Session>;
 			};
 			$fetch: typeof $fetch;
 			$store: typeof $store;
+			$ERROR_CODES: PrettifyDeep<
+				InferErrorCodes<Option> & typeof BASE_ERROR_CODES
+			>;
 		};
 }
+
+export type * from "@better-fetch/fetch";
+export type * from "nanostores";

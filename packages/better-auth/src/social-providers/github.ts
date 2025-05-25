@@ -1,6 +1,10 @@
 import { betterFetch } from "@better-fetch/fetch";
 import type { OAuthProvider, ProviderOptions } from "../oauth2";
-import { createAuthorizationURL, validateAuthorizationCode } from "../oauth2";
+import {
+	createAuthorizationURL,
+	refreshAccessToken,
+	validateAuthorizationCode,
+} from "../oauth2";
 
 export interface GithubProfile {
 	login: string;
@@ -47,19 +51,20 @@ export interface GithubProfile {
 		private_repos: string;
 		collaborators: string;
 	};
-	first_name: string;
-	last_name: string;
 }
 
-export interface GithubOptions extends ProviderOptions {}
+export interface GithubOptions extends ProviderOptions<GithubProfile> {}
 export const github = (options: GithubOptions) => {
 	const tokenEndpoint = "https://github.com/login/oauth/access_token";
 	return {
 		id: "github",
 		name: "GitHub",
-		createAuthorizationURL({ state, scopes, codeVerifier, redirectURI }) {
-			const _scopes = scopes || ["user:email"];
+		createAuthorizationURL({ state, scopes, loginHint, redirectURI }) {
+			const _scopes = options.disableDefaultScope
+				? []
+				: ["read:user", "user:email"];
 			options.scope && _scopes.push(...options.scope);
+			scopes && _scopes.push(...scopes);
 			return createAuthorizationURL({
 				id: "github",
 				options,
@@ -67,17 +72,34 @@ export const github = (options: GithubOptions) => {
 				scopes: _scopes,
 				state,
 				redirectURI,
+				loginHint,
 			});
 		},
 		validateAuthorizationCode: async ({ code, redirectURI }) => {
 			return validateAuthorizationCode({
 				code,
-				redirectURI: options.redirectURI || redirectURI,
+				redirectURI,
 				options,
 				tokenEndpoint,
 			});
 		},
+		refreshAccessToken: options.refreshAccessToken
+			? options.refreshAccessToken
+			: async (refreshToken) => {
+					return refreshAccessToken({
+						refreshToken,
+						options: {
+							clientId: options.clientId,
+							clientKey: options.clientKey,
+							clientSecret: options.clientSecret,
+						},
+						tokenEndpoint: "https://github.com/login/oauth/token",
+					});
+				},
 		async getUserInfo(token) {
+			if (options.getUserInfo) {
+				return options.getUserInfo(token);
+			}
 			const { data: profile, error } = await betterFetch<GithubProfile>(
 				"https://api.github.com/user",
 				{
@@ -90,28 +112,28 @@ export const github = (options: GithubOptions) => {
 			if (error) {
 				return null;
 			}
-			let emailVerified = false;
-			if (!profile.email) {
-				const { data, error } = await betterFetch<
-					{
-						email: string;
-						primary: boolean;
-						verified: boolean;
-						visibility: "public" | "private";
-					}[]
-				>("https://api.github.com/user/emails", {
-					headers: {
-						authorization: `Bearer ${token.accessToken}`,
-						"User-Agent": "better-auth",
-					},
-				});
-				if (!error) {
-					profile.email = (data.find((e) => e.primary) ?? data[0])
-						?.email as string;
-					emailVerified =
-						data.find((e) => e.email === profile.email)?.verified ?? false;
-				}
+			const { data: emails } = await betterFetch<
+				{
+					email: string;
+					primary: boolean;
+					verified: boolean;
+					visibility: "public" | "private";
+				}[]
+			>("https://api.github.com/user/emails", {
+				headers: {
+					Authorization: `Bearer ${token.accessToken}`,
+					"User-Agent": "better-auth",
+				},
+			});
+
+			if (!profile.email && emails) {
+				profile.email = (emails.find((e) => e.primary) ?? emails[0])
+					?.email as string;
 			}
+			const emailVerified =
+				emails?.find((e) => e.email === profile.email)?.verified ?? false;
+
+			const userMap = await options.mapProfileToUser?.(profile);
 			return {
 				user: {
 					id: profile.id.toString(),
@@ -119,9 +141,11 @@ export const github = (options: GithubOptions) => {
 					email: profile.email,
 					image: profile.avatar_url,
 					emailVerified,
+					...userMap,
 				},
 				data: profile,
 			};
 		},
+		options,
 	} satisfies OAuthProvider<GithubProfile>;
 };

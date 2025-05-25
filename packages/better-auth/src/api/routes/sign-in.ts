@@ -2,33 +2,60 @@ import { APIError } from "better-call";
 import { z } from "zod";
 import { createAuthEndpoint } from "../call";
 import { setSessionCookie } from "../../cookies";
-import { socialProviderList } from "../../social-providers";
 import { createEmailVerificationToken } from "./email-verification";
-import { generateState, logger } from "../../utils";
+import { generateState } from "../../utils";
 import { handleOAuthUserInfo } from "../../oauth2/link-account";
+import { BASE_ERROR_CODES } from "../../error/codes";
+import { SocialProviderListEnum } from "../../social-providers";
 
 export const signInSocial = createAuthEndpoint(
 	"/sign-in/social",
 	{
 		method: "POST",
-		query: z
-			.object({
-				/**
-				 * Redirect to the current URL after the
-				 * user has signed in.
-				 */
-				currentURL: z.string().optional(),
-			})
-			.optional(),
 		body: z.object({
 			/**
-			 * Callback URL to redirect to after the user has signed in.
+			 * Callback URL to redirect to after the user
+			 * has signed in.
 			 */
-			callbackURL: z.string().optional(),
+			callbackURL: z
+				.string({
+					description:
+						"Callback URL to redirect to after the user has signed in",
+				})
+				.optional(),
+			/**
+			 * callback url to redirect if the user is newly registered.
+			 *
+			 * useful if you have different routes for existing users and new users
+			 */
+			newUserCallbackURL: z.string().optional(),
+			/**
+			 * Callback url to redirect to if an error happens
+			 *
+			 * If it's initiated from the client sdk this defaults to
+			 * the current url.
+			 */
+			errorCallbackURL: z
+				.string({
+					description: "Callback URL to redirect to if an error happens",
+				})
+				.optional(),
 			/**
 			 * OAuth2 provider to use`
 			 */
-			provider: z.enum(socialProviderList),
+			provider: SocialProviderListEnum,
+			/**
+			 * Disable automatic redirection to the provider
+			 *
+			 * This is useful if you want to handle the redirection
+			 * yourself like in a popup or a different tab.
+			 */
+			disableRedirect: z
+				.boolean({
+					description:
+						"Disable automatic redirection to the provider. Useful for handling the redirection yourself",
+				})
+				.optional(),
 			/**
 			 * ID token from the provider
 			 *
@@ -45,26 +72,145 @@ export const signInSocial = createAuthEndpoint(
 					/**
 					 * ID token from the provider
 					 */
-					token: z.string(),
+					token: z.string({
+						description: "ID token from the provider",
+					}),
 					/**
 					 * The nonce used to generate the token
 					 */
-					nonce: z.string().optional(),
+					nonce: z
+						.string({
+							description: "Nonce used to generate the token",
+						})
+						.optional(),
 					/**
 					 * Access token from the provider
 					 */
-					accessToken: z.string().optional(),
+					accessToken: z
+						.string({
+							description: "Access token from the provider",
+						})
+						.optional(),
 					/**
 					 * Refresh token from the provider
 					 */
-					refreshToken: z.string().optional(),
+					refreshToken: z
+						.string({
+							description: "Refresh token from the provider",
+						})
+						.optional(),
 					/**
 					 * Expiry date of the token
 					 */
-					expiresAt: z.number().optional(),
+					expiresAt: z
+						.number({
+							description: "Expiry date of the token",
+						})
+						.optional(),
 				}),
+				{
+					description:
+						"ID token from the provider to sign in the user with id token",
+				},
 			),
+			scopes: z
+				.array(z.string(), {
+					description:
+						"Array of scopes to request from the provider. This will override the default scopes passed.",
+				})
+				.optional(),
+			/**
+			 * Explicitly request sign-up
+			 *
+			 * Should be used to allow sign up when
+			 * disableImplicitSignUp for this provider is
+			 * true
+			 */
+			requestSignUp: z
+				.boolean({
+					description:
+						"Explicitly request sign-up. Useful when disableImplicitSignUp is true for this provider",
+				})
+				.optional(),
+			/**
+			 * The login hint to use for the authorization code request
+			 */
+			loginHint: z
+				.string({
+					description:
+						"The login hint to use for the authorization code request",
+				})
+				.optional(),
 		}),
+		metadata: {
+			openapi: {
+				description: "Sign in with a social provider",
+				operationId: "socialSignIn",
+				responses: {
+					"200": {
+						description:
+							"Success - Returns either session details or redirect URL",
+						content: {
+							"application/json": {
+								schema: {
+									// todo: we need support for multiple schema
+									type: "object",
+									description: "Session response when idToken is provided",
+									properties: {
+										redirect: {
+											type: "boolean",
+											enum: [false],
+										},
+										token: {
+											type: "string",
+											description: "Session token",
+											url: {
+												type: "null",
+												nullable: true,
+											},
+											user: {
+												type: "object",
+												properties: {
+													id: { type: "string" },
+													email: { type: "string" },
+													name: {
+														type: "string",
+														nullable: true,
+													},
+													image: {
+														type: "string",
+														nullable: true,
+													},
+													emailVerified: {
+														type: "boolean",
+													},
+													createdAt: {
+														type: "string",
+														format: "date-time",
+													},
+													updatedAt: {
+														type: "string",
+														format: "date-time",
+													},
+												},
+												required: [
+													"id",
+													"email",
+													"emailVerified",
+													"createdAt",
+													"updatedAt",
+												],
+											},
+										},
+									},
+									required: ["redirect", "token", "user"],
+								},
+							},
+						},
+					},
+				},
+			},
+		},
 	},
 	async (c) => {
 		const provider = c.context.socialProviders.find(
@@ -78,7 +224,7 @@ export const signInSocial = createAuthEndpoint(
 				},
 			);
 			throw new APIError("NOT_FOUND", {
-				message: "Provider not found",
+				message: BASE_ERROR_CODES.PROVIDER_NOT_FOUND,
 			});
 		}
 
@@ -91,7 +237,7 @@ export const signInSocial = createAuthEndpoint(
 					},
 				);
 				throw new APIError("NOT_FOUND", {
-					message: "Provider does not support id token verification",
+					message: BASE_ERROR_CODES.ID_TOKEN_NOT_SUPPORTED,
 				});
 			}
 			const { token, nonce } = c.body.idToken;
@@ -101,7 +247,7 @@ export const signInSocial = createAuthEndpoint(
 					provider: c.body.provider,
 				});
 				throw new APIError("UNAUTHORIZED", {
-					message: "Invalid id token",
+					message: BASE_ERROR_CODES.INVALID_TOKEN,
 				});
 			}
 			const userInfo = await provider.getUserInfo({
@@ -114,7 +260,7 @@ export const signInSocial = createAuthEndpoint(
 					provider: c.body.provider,
 				});
 				throw new APIError("UNAUTHORIZED", {
-					message: "Failed to get user info",
+					message: BASE_ERROR_CODES.FAILED_TO_GET_USER_INFO,
 				});
 			}
 			if (!userInfo.user.email) {
@@ -122,11 +268,12 @@ export const signInSocial = createAuthEndpoint(
 					provider: c.body.provider,
 				});
 				throw new APIError("UNAUTHORIZED", {
-					message: "User email not found",
+					message: BASE_ERROR_CODES.USER_EMAIL_NOT_FOUND,
 				});
 			}
 			const data = await handleOAuthUserInfo(c, {
 				userInfo: {
+					...userInfo.user,
 					email: userInfo.user.email,
 					id: userInfo.user.id,
 					name: userInfo.user.name || "",
@@ -138,6 +285,10 @@ export const signInSocial = createAuthEndpoint(
 					accountId: userInfo.user.id,
 					accessToken: c.body.idToken.accessToken,
 				},
+				callbackURL: c.body.callbackURL,
+				disableSignUp:
+					(provider.disableImplicitSignUp && !c.body.requestSignUp) ||
+					provider.disableSignUp,
 			});
 			if (data.error) {
 				throw new APIError("UNAUTHORIZED", {
@@ -146,12 +297,18 @@ export const signInSocial = createAuthEndpoint(
 			}
 			await setSessionCookie(c, data.data!);
 			return c.json({
-				session: data.data!.session,
-				user: data.data!.user,
-				url: `${
-					c.body.callbackURL || c.query?.currentURL || c.context.options.baseURL
-				}`,
-				redirect: true,
+				redirect: false,
+				token: data.data!.session.token,
+				url: undefined,
+				user: {
+					id: data.data!.user.id,
+					email: data.data!.user.email,
+					name: data.data!.user.name,
+					image: data.data!.user.image,
+					emailVerified: data.data!.user.emailVerified,
+					createdAt: data.data!.user.createdAt,
+					updatedAt: data.data!.user.updatedAt,
+				},
 			});
 		}
 
@@ -160,11 +317,13 @@ export const signInSocial = createAuthEndpoint(
 			state,
 			codeVerifier,
 			redirectURI: `${c.context.baseURL}/callback/${provider.id}`,
+			scopes: c.body.scopes,
+			loginHint: c.body.loginHint,
 		});
 
 		return c.json({
 			url: url.toString(),
-			redirect: true,
+			redirect: !c.body.disableRedirect,
 		});
 	},
 );
@@ -174,15 +333,108 @@ export const signInEmail = createAuthEndpoint(
 	{
 		method: "POST",
 		body: z.object({
-			email: z.string(),
-			password: z.string(),
-			callbackURL: z.string().optional(),
+			/**
+			 * Email of the user
+			 */
+			email: z.string({
+				description: "Email of the user",
+			}),
+			/**
+			 * Password of the user
+			 */
+			password: z.string({
+				description: "Password of the user",
+			}),
+			/**
+			 * Callback URL to use as a redirect for email
+			 * verification and for possible redirects
+			 */
+			callbackURL: z
+				.string({
+					description:
+						"Callback URL to use as a redirect for email verification",
+				})
+				.optional(),
 			/**
 			 * If this is false, the session will not be remembered
 			 * @default true
 			 */
-			rememberMe: z.boolean().default(false).optional(),
+			rememberMe: z
+				.boolean({
+					description:
+						"If this is false, the session will not be remembered. Default is `true`.",
+				})
+				.default(true)
+				.optional(),
 		}),
+		metadata: {
+			openapi: {
+				description: "Sign in with email and password",
+				responses: {
+					"200": {
+						description:
+							"Success - Returns either session details or redirect URL",
+						content: {
+							"application/json": {
+								schema: {
+									// todo: we need support for multiple schema
+									type: "object",
+									description: "Session response when idToken is provided",
+									properties: {
+										redirect: {
+											type: "boolean",
+											enum: [false],
+										},
+										token: {
+											type: "string",
+											description: "Session token",
+										},
+										url: {
+											type: "null",
+											nullable: true,
+										},
+										user: {
+											type: "object",
+											properties: {
+												id: { type: "string" },
+												email: { type: "string" },
+												name: {
+													type: "string",
+													nullable: true,
+												},
+												image: {
+													type: "string",
+													nullable: true,
+												},
+												emailVerified: {
+													type: "boolean",
+												},
+												createdAt: {
+													type: "string",
+													format: "date-time",
+												},
+												updatedAt: {
+													type: "string",
+													format: "date-time",
+												},
+											},
+											required: [
+												"id",
+												"email",
+												"emailVerified",
+												"createdAt",
+												"updatedAt",
+											],
+										},
+									},
+									required: ["redirect", "token", "user"],
+								},
+							},
+						},
+					},
+				},
+			},
+		},
 	},
 	async (ctx) => {
 		if (!ctx.context.options?.emailAndPassword?.enabled) {
@@ -197,7 +449,7 @@ export const signInEmail = createAuthEndpoint(
 		const isValidEmail = z.string().email().safeParse(email);
 		if (!isValidEmail.success) {
 			throw new APIError("BAD_REQUEST", {
-				message: "Invalid email",
+				message: BASE_ERROR_CODES.INVALID_EMAIL,
 			});
 		}
 		const user = await ctx.context.internalAdapter.findUserByEmail(email, {
@@ -205,10 +457,12 @@ export const signInEmail = createAuthEndpoint(
 		});
 
 		if (!user) {
+			// Hash password to prevent timing attacks from revealing valid email addresses
+			// By hashing passwords for invalid emails, we ensure consistent response times
 			await ctx.context.password.hash(password);
 			ctx.context.logger.error("User not found", { email });
 			throw new APIError("UNAUTHORIZED", {
-				message: "Invalid email or password",
+				message: BASE_ERROR_CODES.INVALID_EMAIL_OR_PASSWORD,
 			});
 		}
 
@@ -218,24 +472,24 @@ export const signInEmail = createAuthEndpoint(
 		if (!credentialAccount) {
 			ctx.context.logger.error("Credential account not found", { email });
 			throw new APIError("UNAUTHORIZED", {
-				message: "Invalid email or password",
+				message: BASE_ERROR_CODES.INVALID_EMAIL_OR_PASSWORD,
 			});
 		}
 		const currentPassword = credentialAccount?.password;
 		if (!currentPassword) {
 			ctx.context.logger.error("Password not found", { email });
 			throw new APIError("UNAUTHORIZED", {
-				message: "Unexpected error",
+				message: BASE_ERROR_CODES.INVALID_EMAIL_OR_PASSWORD,
 			});
 		}
-		const validPassword = await ctx.context.password.verify(
-			currentPassword,
+		const validPassword = await ctx.context.password.verify({
+			hash: currentPassword,
 			password,
-		);
+		});
 		if (!validPassword) {
 			ctx.context.logger.error("Invalid password");
 			throw new APIError("UNAUTHORIZED", {
-				message: "Invalid email or password",
+				message: BASE_ERROR_CODES.INVALID_EMAIL_OR_PASSWORD,
 			});
 		}
 
@@ -244,18 +498,19 @@ export const signInEmail = createAuthEndpoint(
 			!user.user.emailVerified
 		) {
 			if (!ctx.context.options?.emailVerification?.sendVerificationEmail) {
-				logger.error(
-					"Email verification is required but no email verification handler is provided",
-				);
-				throw new APIError("INTERNAL_SERVER_ERROR", {
-					message: "Email is not verified.",
+				throw new APIError("FORBIDDEN", {
+					message: BASE_ERROR_CODES.EMAIL_NOT_VERIFIED,
 				});
 			}
 			const token = await createEmailVerificationToken(
 				ctx.context.secret,
 				user.user.email,
+				undefined,
+				ctx.context.options.emailVerification?.expiresIn,
 			);
-			const url = `${ctx.context.baseURL}/verify-email?token=${token}`;
+			const url = `${
+				ctx.context.baseURL
+			}/verify-email?token=${token}&callbackURL=${ctx.body.callbackURL || "/"}`;
 			await ctx.context.options.emailVerification.sendVerificationEmail(
 				{
 					user: user.user,
@@ -264,23 +519,21 @@ export const signInEmail = createAuthEndpoint(
 				},
 				ctx.request,
 			);
-			ctx.context.logger.error("Email not verified", { email });
 			throw new APIError("FORBIDDEN", {
-				message:
-					"Email is not verified. Check your email for a verification link",
+				message: BASE_ERROR_CODES.EMAIL_NOT_VERIFIED,
 			});
 		}
 
 		const session = await ctx.context.internalAdapter.createSession(
 			user.user.id,
-			ctx.headers,
+			ctx,
 			ctx.body.rememberMe === false,
 		);
 
 		if (!session) {
 			ctx.context.logger.error("Failed to create session");
 			throw new APIError("UNAUTHORIZED", {
-				message: "Failed to create session",
+				message: BASE_ERROR_CODES.FAILED_TO_CREATE_SESSION,
 			});
 		}
 
@@ -293,10 +546,18 @@ export const signInEmail = createAuthEndpoint(
 			ctx.body.rememberMe === false,
 		);
 		return ctx.json({
-			user: user.user,
-			session,
 			redirect: !!ctx.body.callbackURL,
+			token: session.token,
 			url: ctx.body.callbackURL,
+			user: {
+				id: user.user.id,
+				email: user.user.email,
+				name: user.user.name,
+				image: user.user.image,
+				emailVerified: user.user.emailVerified,
+				createdAt: user.user.createdAt,
+				updatedAt: user.user.updatedAt,
+			},
 		});
 	},
 );

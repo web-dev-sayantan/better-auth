@@ -1,79 +1,87 @@
-import type { BetterAuthOptions } from "../types";
-import type { Adapter, Where } from "../types/adapter";
 import { getDate } from "../utils/date";
-import { getAuthTables } from "./get-tables";
+import { parseSessionOutput, parseUserOutput } from "./schema";
 import {
-	parseSessionOutput,
-	parseUserOutput,
 	type Account,
 	type Session,
 	type User,
 	type Verification,
-} from "./schema";
-import { generateId } from "../utils/id";
+} from "../types";
 import { getWithHooks } from "./with-hooks";
 import { getIp } from "../utils/get-request-ip";
-import { convertFromDB } from "./utils";
 import { safeJSONParse } from "../utils/json";
+import { generateId } from "../utils";
+import type {
+	Adapter,
+	AuthContext,
+	BetterAuthOptions,
+	GenericEndpointContext,
+	Where,
+} from "../types";
 
 export const createInternalAdapter = (
 	adapter: Adapter,
 	ctx: {
 		options: BetterAuthOptions;
 		hooks: Exclude<BetterAuthOptions["databaseHooks"], undefined>[];
+		generateId: AuthContext["generateId"];
 	},
 ) => {
 	const options = ctx.options;
 	const secondaryStorage = options.secondaryStorage;
 	const sessionExpiration = options.session?.expiresIn || 60 * 60 * 24 * 7; // 7 days
-	const tables = getAuthTables(options);
-	const { createWithHooks, updateWithHooks } = getWithHooks(adapter, ctx);
+	const { createWithHooks, updateWithHooks, updateManyWithHooks } =
+		getWithHooks(adapter, ctx);
+
 	return {
 		createOAuthUser: async (
 			user: Omit<User, "id" | "createdAt" | "updatedAt"> & Partial<User>,
-			account: Omit<Account, "userId" | "id"> & Partial<Account>,
+			account: Omit<Account, "userId" | "id" | "createdAt" | "updatedAt"> &
+				Partial<Account>,
+			context?: GenericEndpointContext,
 		) => {
-			try {
-				const createdUser = await createWithHooks(
-					{
-						id: generateId(),
-						createdAt: new Date(),
-						updatedAt: new Date(),
-						...user,
-					},
-					"user",
-				);
-				const createdAccount = await createWithHooks(
-					{
-						id: generateId(),
-						...account,
-						userId: createdUser.id || user.id,
-					},
-					"account",
-				);
-				return {
-					user: createdUser,
-					account: createdAccount,
-				};
-			} catch (e) {
-				console.log(e);
-				return null;
-			}
+			const createdUser = await createWithHooks(
+				{
+					createdAt: new Date(),
+					updatedAt: new Date(),
+					...user,
+				},
+				"user",
+				undefined,
+				context,
+			);
+			const createdAccount = await createWithHooks(
+				{
+					...account,
+					userId: createdUser.id || user.id,
+					createdAt: new Date(),
+					updatedAt: new Date(),
+				},
+				"account",
+				undefined,
+				context,
+			);
+			return {
+				user: createdUser,
+				account: createdAccount,
+			};
 		},
 		createUser: async <T>(
 			user: Omit<User, "id" | "createdAt" | "updatedAt" | "emailVerified"> &
 				Partial<User> &
 				Record<string, any>,
+			context?: GenericEndpointContext,
 		) => {
 			const createdUser = await createWithHooks(
 				{
-					id: generateId(),
 					createdAt: new Date(),
 					updatedAt: new Date(),
 					emailVerified: false,
 					...user,
+					email: user.email?.toLowerCase(),
 				},
 				"user",
+				undefined,
+				context,
 			);
 			return createdUser as T & User;
 		},
@@ -81,15 +89,17 @@ export const createInternalAdapter = (
 			account: Omit<Account, "id" | "createdAt" | "updatedAt"> &
 				Partial<Account> &
 				Record<string, any>,
+			context?: GenericEndpointContext,
 		) => {
 			const createdAccount = await createWithHooks(
 				{
-					id: generateId(),
 					createdAt: new Date(),
 					updatedAt: new Date(),
 					...account,
 				},
 				"account",
+				undefined,
+				context,
 			);
 			return createdAccount as T & Account;
 		},
@@ -100,7 +110,7 @@ export const createInternalAdapter = (
 				);
 				if (!currentList) return [];
 
-				const list: { id: string; expiresAt: number }[] =
+				const list: { token: string; expiresAt: number }[] =
 					safeJSONParse(currentList) || [];
 				const now = Date.now();
 
@@ -108,7 +118,7 @@ export const createInternalAdapter = (
 				const sessions = [];
 
 				for (const session of validSessions) {
-					const sessionStringified = await secondaryStorage.get(session.id);
+					const sessionStringified = await secondaryStorage.get(session.token);
 					if (sessionStringified) {
 						const s = JSON.parse(sessionStringified);
 						const parsedSession = parseSessionOutput(ctx.options, {
@@ -122,10 +132,10 @@ export const createInternalAdapter = (
 			}
 
 			const sessions = await adapter.findMany<Session>({
-				model: tables.session.tableName,
+				model: "session",
 				where: [
 					{
-						field: tables.session.fields.userId.fieldName || "userId",
+						field: "userId",
 						value: userId,
 					},
 				],
@@ -142,35 +152,52 @@ export const createInternalAdapter = (
 			where?: Where[],
 		) => {
 			const users = await adapter.findMany<User>({
-				model: tables.user.tableName,
+				model: "user",
 				limit,
 				offset,
 				sortBy,
 				where,
 			});
-			return users.map((user) => convertFromDB(tables.user.fields, user));
+			return users;
+		},
+		countTotalUsers: async (where?: Where[]) => {
+			const total = await adapter.count({
+				model: "user",
+				where,
+			});
+			if (typeof total === "string") {
+				return parseInt(total);
+			}
+			return total;
 		},
 		deleteUser: async (userId: string) => {
+			if (secondaryStorage) {
+				await secondaryStorage.delete(`active-sessions-${userId}`);
+			}
+
+			if (!secondaryStorage || options.session?.storeSessionInDatabase) {
+				await adapter.deleteMany({
+					model: "session",
+					where: [
+						{
+							field: "userId",
+							value: userId,
+						},
+					],
+				});
+			}
+
+			await adapter.deleteMany({
+				model: "account",
+				where: [
+					{
+						field: "userId",
+						value: userId,
+					},
+				],
+			});
 			await adapter.delete({
-				model: tables.account.tableName,
-				where: [
-					{
-						field: tables.account.fields.userId.fieldName || "userId",
-						value: userId,
-					},
-				],
-			});
-			await adapter.deleteMany({
-				model: tables.session.tableName,
-				where: [
-					{
-						field: tables.session.fields.userId.fieldName || "userId",
-						value: userId,
-					},
-				],
-			});
-			await adapter.deleteMany({
-				model: tables.user.tableName,
+				model: "user",
 				where: [
 					{
 						field: "id",
@@ -181,14 +208,20 @@ export const createInternalAdapter = (
 		},
 		createSession: async (
 			userId: string,
-			request: Request | Headers | undefined,
+			ctx: GenericEndpointContext,
 			dontRememberMe?: boolean,
 			override?: Partial<Session> & Record<string, any>,
+			overrideAll?: boolean,
 		) => {
-			const headers = request instanceof Request ? request.headers : request;
-			const data: Session = {
-				id: generateId(32),
-				userId,
+			const headers = ctx.headers || ctx.request?.headers;
+			const { id: _, ...rest } = override || {};
+			const data: Omit<Session, "id"> = {
+				ipAddress:
+					ctx.request || ctx.headers
+						? getIp(ctx.request || ctx.headers!, ctx.context.options) || ""
+						: "",
+				userAgent: headers?.get("user-agent") || "",
+				...rest,
 				/**
 				 * If the user doesn't want to be remembered
 				 * set the session to expire in 1 day.
@@ -197,47 +230,38 @@ export const createInternalAdapter = (
 				expiresAt: dontRememberMe
 					? getDate(60 * 60 * 24, "sec") // 1 day
 					: getDate(sessionExpiration, "sec"),
-				ipAddress: request ? getIp(request, ctx.options) || "" : "",
-				userAgent: headers?.get("user-agent") || "",
-				...override,
+				userId,
+				token: generateId(32),
+				createdAt: new Date(),
+				updatedAt: new Date(),
+				...(overrideAll ? rest : {}),
 			};
 			const res = await createWithHooks(
 				data,
 				"session",
 				secondaryStorage
 					? {
-							fn: async (data) => {
-								const user = await adapter.findOne<User>({
-									model: tables.user.tableName,
-									where: [{ field: "id", value: userId }],
-								});
-								secondaryStorage.set(
-									data.id,
-									JSON.stringify({
-										session: data,
-										user,
-									}),
-									sessionExpiration,
-								);
+							fn: async (sessionData) => {
 								/**
-								 * store the session id for the user
+								 * store the session token for the user
 								 * so we can retrieve it later for listing sessions
 								 */
 								const currentList = await secondaryStorage.get(
 									`active-sessions-${userId}`,
 								);
 
-								let list: { id: string; expiresAt: number }[] = [];
+								let list: { token: string; expiresAt: number }[] = [];
 								const now = Date.now();
 
 								if (currentList) {
 									list = safeJSONParse(currentList) || [];
-									// Remove expired sessions
 									list = list.filter((session) => session.expiresAt > now);
 								}
 
-								// Add new session with expiration time
-								list.push({ id: data.id, expiresAt: now + sessionExpiration });
+								list.push({
+									token: data.token,
+									expiresAt: now + sessionExpiration * 1000,
+								});
 
 								await secondaryStorage.set(
 									`active-sessions-${userId}`,
@@ -245,22 +269,33 @@ export const createInternalAdapter = (
 									sessionExpiration,
 								);
 
-								return data;
+								return sessionData;
 							},
 							executeMainFn: options.session?.storeSessionInDatabase,
 						}
 					: undefined,
+				ctx,
 			);
 			return res as Session;
 		},
-		findSession: async (sessionId: string) => {
+		findSession: async (
+			token: string,
+		): Promise<{
+			session: Session & Record<string, any>;
+			user: User & Record<string, any>;
+		} | null> => {
 			if (secondaryStorage) {
-				const sessionStringified = await secondaryStorage.get(sessionId);
+				const sessionStringified = await secondaryStorage.get(token);
+				if (!sessionStringified && !options.session?.storeSessionInDatabase) {
+					return null;
+				}
 				if (sessionStringified) {
 					const s = JSON.parse(sessionStringified);
 					const parsedSession = parseSessionOutput(ctx.options, {
 						...s.session,
 						expiresAt: new Date(s.session.expiresAt),
+						createdAt: new Date(s.session.createdAt),
+						updatedAt: new Date(s.session.updatedAt),
 					});
 					const parsedUser = parseUserOutput(ctx.options, {
 						...s.user,
@@ -270,31 +305,26 @@ export const createInternalAdapter = (
 					return {
 						session: parsedSession,
 						user: parsedUser,
-					} as {
-						session: Session;
-						user: User;
 					};
 				}
 			}
 
-			const _session = await adapter.findOne<Session>({
-				model: tables.session.tableName,
+			const session = await adapter.findOne<Session>({
+				model: "session",
 				where: [
 					{
-						value: sessionId,
-						field: "id",
+						value: token,
+						field: "token",
 					},
 				],
 			});
 
-			if (!_session) {
+			if (!session) {
 				return null;
 			}
 
-			const session = convertFromDB(tables.session.fields, _session)!;
-
 			const user = await adapter.findOne<User>({
-				model: tables.user.tableName,
+				model: "user",
 				where: [
 					{
 						value: session.userId,
@@ -305,23 +335,22 @@ export const createInternalAdapter = (
 			if (!user) {
 				return null;
 			}
-			const parsedUser = parseUserOutput(
-				ctx.options,
-				convertFromDB(tables.user.fields, user)!,
-			);
+			const parsedSession = parseSessionOutput(ctx.options, session);
+			const parsedUser = parseUserOutput(ctx.options, user);
+
 			return {
-				session: parseSessionOutput(ctx.options, session),
+				session: parsedSession,
 				user: parsedUser,
 			};
 		},
-		findSessions: async (sessionIds: string[]) => {
+		findSessions: async (sessionTokens: string[]) => {
 			if (secondaryStorage) {
 				const sessions: {
 					session: Session;
 					user: User;
 				}[] = [];
-				for (const sessionId of sessionIds) {
-					const sessionStringified = await secondaryStorage.get(sessionId);
+				for (const sessionToken of sessionTokens) {
+					const sessionStringified = await secondaryStorage.get(sessionToken);
 					if (sessionStringified) {
 						const s = JSON.parse(sessionStringified);
 						const session = {
@@ -345,22 +374,21 @@ export const createInternalAdapter = (
 			}
 
 			const sessions = await adapter.findMany<Session>({
-				model: tables.session.tableName,
+				model: "session",
 				where: [
 					{
-						field: "id",
-						value: sessionIds,
+						field: "token",
+						value: sessionTokens,
 						operator: "in",
 					},
 				],
 			});
 			const userIds = sessions.map((session) => {
-				const s = convertFromDB(tables.session.fields, session)!;
-				return s.userId;
+				return session.userId;
 			});
 			if (!userIds.length) return [];
 			const users = await adapter.findMany<User>({
-				model: tables.user.tableName,
+				model: "user",
 				where: [
 					{
 						field: "id",
@@ -373,23 +401,27 @@ export const createInternalAdapter = (
 				const user = users.find((u) => u.id === session.userId);
 				if (!user) return null;
 				return {
-					session: convertFromDB(tables.session.fields, session)!,
-					user: convertFromDB(tables.user.fields, user)!,
+					session,
+					user,
 				};
 			}) as {
 				session: Session;
 				user: User;
 			}[];
 		},
-		updateSession: async (sessionId: string, session: Partial<Session>) => {
+		updateSession: async (
+			sessionToken: string,
+			session: Partial<Session> & Record<string, any>,
+			context?: GenericEndpointContext,
+		) => {
 			const updatedSession = await updateWithHooks<Session>(
 				session,
-				[{ field: "id", value: sessionId }],
+				[{ field: "token", value: sessionToken }],
 				"session",
 				secondaryStorage
 					? {
 							async fn(data) {
-								const currentSession = await secondaryStorage.get(sessionId);
+								const currentSession = await secondaryStorage.get(sessionToken);
 								let updatedSession: Session | null = null;
 								if (currentSession) {
 									const parsedSession = JSON.parse(currentSession) as {
@@ -400,20 +432,7 @@ export const createInternalAdapter = (
 										...parsedSession.session,
 										...data,
 									};
-									await secondaryStorage.set(
-										sessionId,
-										JSON.stringify({
-											session: updatedSession,
-											user: parsedSession.user,
-										}),
-										parsedSession.session.expiresAt
-											? Math.floor(
-													(parsedSession.session.expiresAt.getTime() -
-														Date.now()) /
-														1000,
-												)
-											: sessionExpiration,
-									);
+									return updatedSession;
 								} else {
 									return null;
 								}
@@ -421,111 +440,195 @@ export const createInternalAdapter = (
 							executeMainFn: options.session?.storeSessionInDatabase,
 						}
 					: undefined,
+				context,
 			);
 			return updatedSession;
 		},
-		deleteSession: async (id: string) => {
+		deleteSession: async (token: string) => {
 			if (secondaryStorage) {
-				await secondaryStorage.delete(id);
-				if (options.session?.storeSessionInDatabase) {
-					await adapter.delete<Session>({
-						model: tables.session.tableName,
-						where: [
-							{
-								field: "id",
-								value: id,
-							},
-						],
-					});
+				await secondaryStorage.delete(token);
+
+				if (
+					!options.session?.storeSessionInDatabase ||
+					ctx.options.session?.preserveSessionInDatabase
+				) {
+					return;
 				}
-				return;
 			}
 			await adapter.delete<Session>({
-				model: tables.session.tableName,
+				model: "session",
 				where: [
 					{
-						field: "id",
-						value: id,
+						field: "token",
+						value: token,
 					},
 				],
 			});
 		},
-		deleteSessions: async (userId: string) => {
-			if (secondaryStorage) {
-				const sessions = await adapter.findMany<Session>({
-					model: tables.session.tableName,
-					where: [
-						{
-							field: tables.session.fields.userId.fieldName || "userId",
-							value: userId,
-						},
-					],
-				});
-				for (const session of sessions) {
-					await secondaryStorage.delete(session.id);
-				}
-				if (options.session?.storeSessionInDatabase) {
-					await adapter.delete({
-						model: tables.session.tableName,
-						where: [
-							{
-								field: tables.session.fields.userId.fieldName || "userId",
-								value: userId,
-							},
-						],
-					});
-				}
-				return;
-			}
+		deleteAccounts: async (userId: string) => {
 			await adapter.deleteMany({
-				model: tables.session.tableName,
+				model: "account",
 				where: [
 					{
-						field: tables.session.fields.userId.fieldName || "userId",
+						field: "userId",
 						value: userId,
 					},
 				],
 			});
+		},
+		deleteAccount: async (accountId: string) => {
+			await adapter.delete({
+				model: "account",
+				where: [
+					{
+						field: "id",
+						value: accountId,
+					},
+				],
+			});
+		},
+		deleteSessions: async (userIdOrSessionTokens: string | string[]) => {
+			if (secondaryStorage) {
+				if (typeof userIdOrSessionTokens === "string") {
+					const activeSession = await secondaryStorage.get(
+						`active-sessions-${userIdOrSessionTokens}`,
+					);
+					const sessions = activeSession
+						? safeJSONParse<{ token: string }[]>(activeSession)
+						: [];
+					if (!sessions) return;
+					for (const session of sessions) {
+						await secondaryStorage.delete(session.token);
+					}
+				} else {
+					for (const sessionToken of userIdOrSessionTokens) {
+						const session = await secondaryStorage.get(sessionToken);
+						if (session) {
+							await secondaryStorage.delete(sessionToken);
+						}
+					}
+				}
+
+				if (
+					!options.session?.storeSessionInDatabase ||
+					ctx.options.session?.preserveSessionInDatabase
+				) {
+					return;
+				}
+			}
+			await adapter.deleteMany({
+				model: "session",
+				where: [
+					{
+						field: Array.isArray(userIdOrSessionTokens) ? "token" : "userId",
+						value: userIdOrSessionTokens,
+						operator: Array.isArray(userIdOrSessionTokens) ? "in" : undefined,
+					},
+				],
+			});
+		},
+		findOAuthUser: async (
+			email: string,
+			accountId: string,
+			providerId: string,
+		) => {
+			const account = await adapter.findOne<Account>({
+				model: "account",
+				where: [
+					{
+						value: accountId,
+						field: "accountId",
+					},
+					{
+						value: providerId,
+						field: "providerId",
+					},
+				],
+			});
+			if (account) {
+				const user = await adapter.findOne<User>({
+					model: "user",
+					where: [
+						{
+							value: account.userId,
+							field: "id",
+						},
+					],
+				});
+				if (user) {
+					return {
+						user,
+						accounts: [account],
+					};
+				} else {
+					return null;
+				}
+			} else {
+				const user = await adapter.findOne<User>({
+					model: "user",
+					where: [
+						{
+							value: email.toLowerCase(),
+							field: "email",
+						},
+					],
+				});
+				if (user) {
+					const accounts = await adapter.findMany<Account>({
+						model: "account",
+						where: [
+							{
+								value: user.id,
+								field: "userId",
+							},
+						],
+					});
+					return {
+						user,
+						accounts: accounts || [],
+					};
+				} else {
+					return null;
+				}
+			}
 		},
 		findUserByEmail: async (
 			email: string,
 			options?: { includeAccounts: boolean },
 		) => {
 			const user = await adapter.findOne<User>({
-				model: tables.user.tableName,
+				model: "user",
 				where: [
 					{
 						value: email.toLowerCase(),
-						field: tables.user.fields.email.fieldName || "email",
+						field: "email",
 					},
 				],
 			});
 			if (!user) return null;
 			if (options?.includeAccounts) {
 				const accounts = await adapter.findMany<Account>({
-					model: tables.account.tableName,
+					model: "account",
 					where: [
 						{
 							value: user.id,
-							field: tables.account.fields.userId.fieldName || "userId",
+							field: "userId",
 						},
 					],
 				});
 				return {
-					user: convertFromDB(tables.user.fields, user)!,
-					accounts: accounts.map(
-						(account) => convertFromDB(tables.account.fields, account)!,
-					),
+					user,
+					accounts,
 				};
 			}
 			return {
-				user: convertFromDB(tables.user.fields, user)!,
+				user,
 				accounts: [],
 			};
 		},
 		findUserById: async (userId: string) => {
 			const user = await adapter.findOne<User>({
-				model: tables.user.tableName,
+				model: "user",
 				where: [
 					{
 						field: "id",
@@ -535,19 +638,27 @@ export const createInternalAdapter = (
 			});
 			return user;
 		},
-		linkAccount: async (account: Omit<Account, "id"> & Partial<Account>) => {
+		linkAccount: async (
+			account: Omit<Account, "id" | "createdAt" | "updatedAt"> &
+				Partial<Account>,
+			context?: GenericEndpointContext,
+		) => {
 			const _account = await createWithHooks(
 				{
-					id: generateId(),
 					...account,
+					createdAt: new Date(),
+					updatedAt: new Date(),
 				},
 				"account",
+				undefined,
+				context,
 			);
 			return _account;
 		},
 		updateUser: async (
 			userId: string,
 			data: Partial<User> & Record<string, any>,
+			context?: GenericEndpointContext,
 		) => {
 			const user = await updateWithHooks<User>(
 				data,
@@ -558,124 +669,185 @@ export const createInternalAdapter = (
 					},
 				],
 				"user",
+				undefined,
+				context,
 			);
 			return user;
 		},
 		updateUserByEmail: async (
 			email: string,
 			data: Partial<User & Record<string, any>>,
+			context?: GenericEndpointContext,
 		) => {
 			const user = await updateWithHooks<User>(
 				data,
 				[
 					{
-						field: tables.user.fields.email.fieldName || "email",
-						value: email,
+						field: "email",
+						value: email.toLowerCase(),
 					},
 				],
 				"user",
+				undefined,
+				context,
 			);
 			return user;
 		},
-		updatePassword: async (userId: string, password: string) => {
-			const account = await updateWithHooks<Account>(
+		updatePassword: async (
+			userId: string,
+			password: string,
+			context?: GenericEndpointContext,
+		) => {
+			await updateManyWithHooks(
 				{
 					password,
 				},
 				[
 					{
-						field: tables.account.fields.userId.fieldName || "userId",
+						field: "userId",
 						value: userId,
 					},
 					{
-						field: tables.account.fields.providerId.fieldName || "providerId",
+						field: "providerId",
 						value: "credential",
 					},
 				],
 				"account",
+				undefined,
+				context,
 			);
-			return account;
 		},
 		findAccounts: async (userId: string) => {
 			const accounts = await adapter.findMany<Account>({
-				model: tables.account.tableName,
+				model: "account",
 				where: [
 					{
-						field: tables.account.fields.userId.fieldName || "userId",
+						field: "userId",
 						value: userId,
 					},
 				],
 			});
-			return accounts.map(
-				(account) => convertFromDB(tables.account.fields, account) as Account,
-			);
+			return accounts;
 		},
 		findAccount: async (accountId: string) => {
 			const account = await adapter.findOne<Account>({
-				model: tables.account.tableName,
+				model: "account",
 				where: [
 					{
-						field: tables.account.fields.accountId.fieldName || "accountId",
+						field: "accountId",
 						value: accountId,
 					},
 				],
 			});
 			return account;
 		},
-		updateAccount: async (accountId: string, data: Partial<Account>) => {
+		findAccountByProviderId: async (accountId: string, providerId: string) => {
+			const account = await adapter.findOne<Account>({
+				model: "account",
+				where: [
+					{
+						field: "accountId",
+						value: accountId,
+					},
+					{
+						field: "providerId",
+						value: providerId,
+					},
+				],
+			});
+			return account;
+		},
+		findAccountByUserId: async (userId: string) => {
+			const account = await adapter.findMany<Account>({
+				model: "account",
+				where: [
+					{
+						field: "userId",
+						value: userId,
+					},
+				],
+			});
+			return account;
+		},
+		updateAccount: async (
+			id: string,
+			data: Partial<Account>,
+			context?: GenericEndpointContext,
+		) => {
 			const account = await updateWithHooks<Account>(
 				data,
-				[{ field: "id", value: accountId }],
+				[{ field: "id", value: id }],
 				"account",
+				undefined,
+				context,
 			);
 			return account;
 		},
-		createVerificationValue: async (data: Omit<Verification, "id">) => {
+		createVerificationValue: async (
+			data: Omit<Verification, "createdAt" | "id" | "updatedAt"> &
+				Partial<Verification>,
+			context?: GenericEndpointContext,
+		) => {
 			const verification = await createWithHooks(
 				{
-					id: generateId(),
+					createdAt: new Date(),
+					updatedAt: new Date(),
 					...data,
 				},
 				"verification",
+				undefined,
+				context,
 			);
 			return verification as Verification;
 		},
 		findVerificationValue: async (identifier: string) => {
 			const verification = await adapter.findMany<Verification>({
-				model: tables.verification.tableName,
+				model: "verification",
 				where: [
 					{
-						field:
-							tables.verification.fields.identifier.fieldName || "identifier",
+						field: "identifier",
 						value: identifier,
 					},
 				],
-				limit: 100,
+				sortBy: {
+					field: "createdAt",
+					direction: "desc",
+				},
+				limit: 1,
 			});
-			const lastVerification = verification.pop();
-			if (verification.length > 0) {
+			if (!options.verification?.disableCleanup) {
 				await adapter.deleteMany({
-					model: tables.verification.tableName,
+					model: "verification",
 					where: [
 						{
-							operator: "in",
-							field: "id",
-							value: verification.map((v) => v.id),
+							field: "expiresAt",
+							value: new Date(),
+							operator: "lt",
 						},
 					],
 				});
 			}
-			return lastVerification
-				? convertFromDB(tables.verification.fields, lastVerification)
-				: null;
+			const lastVerification = verification[0];
+			return lastVerification as Verification | null;
 		},
 		deleteVerificationValue: async (id: string) => {
 			await adapter.delete<Verification>({
-				model: tables.verification.tableName,
+				model: "verification",
 				where: [
 					{
 						field: "id",
 						value: id,
+					},
+				],
+			});
+		},
+		deleteVerificationByIdentifier: async (identifier: string) => {
+			await adapter.delete<Verification>({
+				model: "verification",
+				where: [
+					{
+						field: "identifier",
+						value: identifier,
 					},
 				],
 			});
@@ -683,11 +855,14 @@ export const createInternalAdapter = (
 		updateVerificationValue: async (
 			id: string,
 			data: Partial<Verification>,
+			context?: GenericEndpointContext,
 		) => {
 			const verification = await updateWithHooks<Verification>(
 				data,
 				[{ field: "id", value: id }],
 				"verification",
+				undefined,
+				context,
 			);
 			return verification;
 		},

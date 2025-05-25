@@ -11,6 +11,9 @@ import type { KyselyDatabaseType } from "./types";
 function getDatabaseType(
 	db: BetterAuthOptions["database"],
 ): KyselyDatabaseType | null {
+	if (!db) {
+		return null;
+	}
 	if ("dialect" in db) {
 		return getDatabaseType(db.dialect as Dialect);
 	}
@@ -38,12 +41,21 @@ function getDatabaseType(
 	if ("connect" in db) {
 		return "postgres";
 	}
-
+	if ("fileControl" in db) {
+		return "sqlite";
+	}
 	return null;
 }
 
 export const createKyselyAdapter = async (config: BetterAuthOptions) => {
 	const db = config.database;
+
+	if (!db) {
+		return {
+			kysely: null,
+			databaseType: null,
+		};
+	}
 
 	if ("db" in db) {
 		return {
@@ -81,6 +93,13 @@ export const createKyselyAdapter = async (config: BetterAuthOptions) => {
 	if ("connect" in db) {
 		dialect = new PostgresDialect({
 			pool: db,
+		});
+	}
+
+	if ("fileControl" in db) {
+		const { BunSqliteDialect } = await import("./bun-sqlite-dialect");
+		dialect = new BunSqliteDialect({
+			database: db,
 		});
 	}
 

@@ -1,18 +1,23 @@
-import type { Endpoint, EndpointOptions, EndpointResponse } from "better-call";
 import type { Migration } from "kysely";
-import type { AuthEndpoint } from "../api/call";
+import { type AuthMiddleware } from "../api/call";
 import type { FieldAttribute } from "../db/field";
-import type { HookEndpointContext } from "./context";
-import type { DeepPartial, LiteralString } from "./helper";
-import type { Adapter, AuthContext, BetterAuthOptions } from ".";
+import type { HookEndpointContext } from ".";
+import type {
+	DeepPartial,
+	LiteralString,
+	UnionToIntersection,
+} from "../types/helper";
 
-export type PluginSchema = {
+import type { AuthContext, BetterAuthOptions } from ".";
+import type { Endpoint, Middleware } from "better-call";
+
+export type AuthPluginSchema = {
 	[table in string]: {
 		fields: {
 			[field in string]: FieldAttribute;
 		};
 		disableMigration?: boolean;
-		tableName?: string;
+		modelName?: string;
 	};
 };
 
@@ -27,11 +32,11 @@ export type BetterAuthPlugin = {
 		options?: Partial<BetterAuthOptions>;
 	} | void;
 	endpoints?: {
-		[key: string]: AuthEndpoint;
+		[key: string]: Endpoint;
 	};
 	middlewares?: {
 		path: string;
-		middleware: Endpoint;
+		middleware: Middleware;
 	}[];
 	onRequest?: (
 		request: Request,
@@ -54,25 +59,11 @@ export type BetterAuthPlugin = {
 	hooks?: {
 		before?: {
 			matcher: (context: HookEndpointContext) => boolean;
-			handler: (context: HookEndpointContext) => Promise<void | {
-				context: Partial<HookEndpointContext>;
-			}>;
+			handler: AuthMiddleware;
 		}[];
 		after?: {
-			matcher: (
-				context: HookEndpointContext<{
-					returned: unknown;
-					endpoint: Endpoint;
-				}>,
-			) => boolean;
-			handler: (
-				context: HookEndpointContext<{
-					returned: unknown;
-					endpoint: Endpoint;
-				}>,
-			) => Promise<void | {
-				response: unknown;
-			}>;
+			matcher: (context: HookEndpointContext) => boolean;
+			handler: AuthMiddleware;
 		}[];
 	};
 	/**
@@ -99,10 +90,10 @@ export type BetterAuthPlugin = {
 	 * 			},
 	 * 		},
 	 * 	}
-	 * } as PluginSchema
+	 * } as AuthPluginSchema
 	 * ```
 	 */
-	schema?: PluginSchema;
+	schema?: AuthPluginSchema;
 	/**
 	 * The migrations of the plugin. If you define schema that will automatically create
 	 * migrations for you.
@@ -115,6 +106,9 @@ export type BetterAuthPlugin = {
 	 * The options of the plugin
 	 */
 	options?: Record<string, any>;
+	/**
+	 * types to be inferred
+	 */
 	$Infer?: Record<string, any>;
 	/**
 	 * The rate limit rules to apply to specific paths.
@@ -124,4 +118,33 @@ export type BetterAuthPlugin = {
 		max: number;
 		pathMatcher: (path: string) => boolean;
 	}[];
+	/**
+	 * The error codes returned by the plugin
+	 */
+	$ERROR_CODES?: Record<string, string>;
 };
+
+export type InferOptionSchema<S extends AuthPluginSchema> = S extends Record<
+	string,
+	{ fields: infer Fields }
+>
+	? {
+			[K in keyof S]?: {
+				modelName?: string;
+				fields?: {
+					[P in keyof Fields]?: string;
+				};
+			};
+		}
+	: never;
+
+export type InferPluginErrorCodes<O extends BetterAuthOptions> =
+	O["plugins"] extends Array<infer P>
+		? UnionToIntersection<
+				P extends BetterAuthPlugin
+					? P["$ERROR_CODES"] extends Record<string, any>
+						? P["$ERROR_CODES"]
+						: {}
+					: {}
+			>
+		: {};

@@ -1,6 +1,10 @@
 import { betterFetch } from "@better-fetch/fetch";
 import type { OAuthProvider, ProviderOptions } from "../oauth2";
-import { createAuthorizationURL, validateAuthorizationCode } from "../oauth2";
+import {
+	createAuthorizationURL,
+	refreshAccessToken,
+	validateAuthorizationCode,
+} from "../oauth2";
 
 export interface TwitterProfile {
 	data: {
@@ -11,7 +15,7 @@ export interface TwitterProfile {
 		id: string;
 		/** The friendly name of this user, as shown on their profile. */
 		name: string;
-		/** @note Email is currently unsupported by Twitter.  */
+		/** The email address of this user. */
 		email?: string;
 		/** The Twitter handle (screen name) of this user. */
 		username: string;
@@ -91,19 +95,18 @@ export interface TwitterProfile {
 	[claims: string]: unknown;
 }
 
-export interface TwitterOption extends ProviderOptions {}
+export interface TwitterOption extends ProviderOptions<TwitterProfile> {}
 
 export const twitter = (options: TwitterOption) => {
 	return {
 		id: "twitter",
 		name: "Twitter",
 		createAuthorizationURL(data) {
-			const _scopes = data.scopes || [
-				"users.read",
-				"tweet.read",
-				"offline.access",
-			];
+			const _scopes = options.disableDefaultScope
+				? []
+				: ["users.read", "tweet.read", "offline.access", "users.email"];
 			options.scope && _scopes.push(...options.scope);
+			data.scopes && _scopes.push(...data.scopes);
 			return createAuthorizationURL({
 				id: "twitter",
 				options,
@@ -119,34 +122,68 @@ export const twitter = (options: TwitterOption) => {
 				code,
 				codeVerifier,
 				authentication: "basic",
-				redirectURI: options.redirectURI || redirectURI,
+				redirectURI,
 				options,
 				tokenEndpoint: "https://api.x.com/2/oauth2/token",
 			});
 		},
-		async getUserInfo(token) {
-			const { data: profile, error } = await betterFetch<TwitterProfile>(
-				"https://api.x.com/2/users/me?user.fields=profile_image_url",
-				{
-					method: "GET",
-					headers: {
-						Authorization: `Bearer ${token.accessToken}`,
-					},
+
+		refreshAccessToken: options.refreshAccessToken
+			? options.refreshAccessToken
+			: async (refreshToken) => {
+					return refreshAccessToken({
+						refreshToken,
+						options: {
+							clientId: options.clientId,
+							clientKey: options.clientKey,
+							clientSecret: options.clientSecret,
+						},
+						tokenEndpoint: "https://api.x.com/2/oauth2/token",
+					});
 				},
-			);
-			if (error) {
+		async getUserInfo(token) {
+			if (options.getUserInfo) {
+				return options.getUserInfo(token);
+			}
+			const { data: profile, error: profileError } =
+				await betterFetch<TwitterProfile>(
+					"https://api.x.com/2/users/me?user.fields=profile_image_url",
+					{
+						method: "GET",
+						headers: {
+							Authorization: `Bearer ${token.accessToken}`,
+						},
+					},
+				);
+
+			if (profileError) {
 				return null;
 			}
+
+			const { data: emailData, error: emailError } = await betterFetch<{
+				data: { confirmed_email: string };
+			}>("https://api.x.com/2/users/me?user.fields=confirmed_email", {
+				method: "GET",
+				headers: {
+					Authorization: `Bearer ${token.accessToken}`,
+				},
+			});
+			if (!emailError && emailData?.data?.confirmed_email) {
+				profile.data.email = emailData.data.confirmed_email;
+			}
+			const userMap = await options.mapProfileToUser?.(profile);
 			return {
 				user: {
 					id: profile.data.id,
 					name: profile.data.name,
-					email: profile.data.email || null,
+					email: profile.data.email || profile.data.username || null,
 					image: profile.data.profile_image_url,
 					emailVerified: profile.data.verified || false,
+					...userMap,
 				},
 				data: profile,
 			};
 		},
+		options,
 	} satisfies OAuthProvider<TwitterProfile>;
 };

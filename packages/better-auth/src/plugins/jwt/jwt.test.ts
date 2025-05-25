@@ -9,7 +9,7 @@ describe("jwt", async (it) => {
 	const { auth, signInWithTestUser } = await getTestInstance({
 		plugins: [jwt()],
 		logger: {
-			verboseLogging: true,
+			level: "error",
 		},
 	});
 
@@ -22,6 +22,20 @@ describe("jwt", async (it) => {
 				return auth.handler(new Request(url, init));
 			},
 		},
+	});
+
+	it("should get a token", async () => {
+		let token = "";
+		await client.getSession({
+			fetchOptions: {
+				headers,
+				onSuccess(context) {
+					token = context.response.headers.get("set-auth-jwt") || "";
+				},
+			},
+		});
+
+		expect(token.length).toBeGreaterThan(10);
 	});
 
 	it("Get a token", async () => {
@@ -59,10 +73,30 @@ describe("jwt", async (it) => {
 
 		const jwks = await client.jwks();
 
-		const publicWebKey = await importJWK(jwks.data?.keys[0]);
-
+		const publicWebKey = await importJWK({
+			...jwks.data?.keys[0],
+			alg: "EdDSA",
+		});
 		const decoded = await jwtVerify(token.data?.token!, publicWebKey);
 
 		expect(decoded).toBeDefined();
+	});
+
+	it("should set subject to user id by default", async () => {
+		const token = await client.token({
+			fetchOptions: {
+				headers,
+			},
+		});
+
+		const jwks = await client.jwks();
+
+		const publicWebKey = await importJWK({
+			...jwks.data?.keys[0],
+			alg: "EdDSA",
+		});
+		const decoded = await jwtVerify(token.data?.token!, publicWebKey);
+		expect(decoded.payload.sub).toBeDefined();
+		expect(decoded.payload.sub).toBe(decoded.payload.id);
 	});
 });

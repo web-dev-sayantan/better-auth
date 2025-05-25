@@ -1,13 +1,15 @@
 import type { CookieOptions } from "better-call";
-import { TimeSpan } from "oslo";
-import type { BetterAuthOptions } from "../types/options";
-import type { GenericEndpointContext } from "../types/context";
 import { BetterAuthError } from "../error";
-import { isProduction } from "../utils/env";
 import type { Session, User } from "../types";
-import { hmac } from "../crypto/hash";
-import { base64, base64url } from "oslo/encoding";
+import type { GenericEndpointContext } from "../types/context";
+import type { BetterAuthOptions } from "../types/options";
 import { getDate } from "../utils/date";
+import { isProduction } from "../utils/env";
+import { base64Url } from "@better-auth/utils/base64";
+import { createTime } from "../utils/time";
+import { createHMAC } from "@better-auth/utils/hmac";
+import { safeJSONParse } from "../utils/json";
+import { getBaseURL } from "../utils/url";
 
 export function createCookieGetter(options: BetterAuthOptions) {
 	const secure =
@@ -62,7 +64,7 @@ export function createCookieGetter(options: BetterAuthOptions) {
 export function getCookies(options: BetterAuthOptions) {
 	const createCookie = createCookieGetter(options);
 	const sessionMaxAge =
-		options.session?.expiresIn || new TimeSpan(7, "d").seconds();
+		options.session?.expiresIn || createTime(7, "d").toSeconds();
 	const sessionToken = createCookie("session_token", {
 		maxAge: sessionMaxAge,
 	});
@@ -92,29 +94,96 @@ export function getCookies(options: BetterAuthOptions) {
 
 export type BetterAuthCookies = ReturnType<typeof getCookies>;
 
+export async function setCookieCache(
+	ctx: GenericEndpointContext,
+	session: {
+		session: Session & Record<string, any>;
+		user: User;
+	},
+) {
+	const shouldStoreSessionDataInCookie =
+		ctx.context.options.session?.cookieCache?.enabled;
+
+	if (shouldStoreSessionDataInCookie) {
+		const filteredSession = Object.entries(session.session).reduce(
+			(acc, [key, value]) => {
+				const fieldConfig =
+					ctx.context.options.session?.additionalFields?.[key];
+				if (!fieldConfig || fieldConfig.returned !== false) {
+					acc[key] = value;
+				}
+				return acc;
+			},
+			{} as Record<string, any>,
+		);
+		const sessionData = { session: filteredSession, user: session.user };
+		const data = base64Url.encode(
+			JSON.stringify({
+				session: sessionData,
+				expiresAt: getDate(
+					ctx.context.authCookies.sessionData.options.maxAge || 60,
+					"sec",
+				).getTime(),
+				signature: await createHMAC("SHA-256", "base64urlnopad").sign(
+					ctx.context.secret,
+					JSON.stringify({
+						...sessionData,
+						expiresAt: getDate(
+							ctx.context.authCookies.sessionData.options.maxAge || 60,
+							"sec",
+						).getTime(),
+					}),
+				),
+			}),
+			{
+				padding: false,
+			},
+		);
+		if (data.length > 4093) {
+			throw new BetterAuthError(
+				"Session data is too large to store in the cookie. Please disable session cookie caching or reduce the size of the session data",
+			);
+		}
+		ctx.setCookie(
+			ctx.context.authCookies.sessionData.name,
+			data,
+			ctx.context.authCookies.sessionData.options,
+		);
+	}
+}
+
 export async function setSessionCookie(
 	ctx: GenericEndpointContext,
 	session: {
-		session: Session;
+		session: Session & Record<string, any>;
 		user: User;
 	},
 	dontRememberMe?: boolean,
 	overrides?: Partial<CookieOptions>,
 ) {
+	const dontRememberMeCookie = await ctx.getSignedCookie(
+		ctx.context.authCookies.dontRememberToken.name,
+		ctx.context.secret,
+	);
+	// if dontRememberMe is not set, use the cookie value
+	dontRememberMe =
+		dontRememberMe !== undefined ? dontRememberMe : !!dontRememberMeCookie;
+
 	const options = ctx.context.authCookies.sessionToken.options;
-	options.maxAge = dontRememberMe
+	const maxAge = dontRememberMe
 		? undefined
 		: ctx.context.sessionConfig.expiresIn;
-
 	await ctx.setSignedCookie(
 		ctx.context.authCookies.sessionToken.name,
-		session.session.id,
+		session.session.token,
 		ctx.context.secret,
 		{
 			...options,
+			maxAge,
 			...overrides,
 		},
 	);
+
 	if (dontRememberMe) {
 		await ctx.setSignedCookie(
 			ctx.context.authCookies.dontRememberToken.name,
@@ -123,30 +192,8 @@ export async function setSessionCookie(
 			ctx.context.authCookies.dontRememberToken.options,
 		);
 	}
-	const shouldStoreSessionDataInCookie =
-		ctx.context.options.session?.cookieCache?.enabled;
-	shouldStoreSessionDataInCookie &&
-		ctx.setCookie(
-			ctx.context.authCookies.sessionData.name,
-			JSON.stringify(
-				base64url.encode(
-					new TextEncoder().encode(
-						JSON.stringify({
-							session: session,
-							expiresAt: getDate(
-								ctx.context.authCookies.sessionData.options.maxAge || 60,
-								"sec",
-							).getTime(),
-							signature: await hmac.sign({
-								value: JSON.stringify(session),
-								secret: ctx.context.secret,
-							}),
-						}),
-					),
-				),
-			),
-			ctx.context.authCookies.sessionData.options,
-		);
+	await setCookieCache(ctx, session);
+	ctx.context.setNewSession(session);
 	/**
 	 * If secondary storage is enabled, store the session data in the secondary storage
 	 * This is useful if the session got updated and we want to update the session data in the
@@ -154,26 +201,36 @@ export async function setSessionCookie(
 	 */
 	if (ctx.context.options.secondaryStorage) {
 		await ctx.context.secondaryStorage?.set(
-			session.session.id,
+			session.session.token,
 			JSON.stringify({
 				user: session.user,
 				session: session.session,
 			}),
-			session.session.expiresAt.getTime() - Date.now(), // set the expiry time to the same as the session
+			Math.floor(
+				(new Date(session.session.expiresAt).getTime() - Date.now()) / 1000,
+			),
 		);
 	}
 }
 
-export function deleteSessionCookie(ctx: GenericEndpointContext) {
+export function deleteSessionCookie(
+	ctx: GenericEndpointContext,
+	skipDontRememberMe?: boolean,
+) {
 	ctx.setCookie(ctx.context.authCookies.sessionToken.name, "", {
+		...ctx.context.authCookies.sessionToken.options,
 		maxAge: 0,
 	});
 	ctx.setCookie(ctx.context.authCookies.sessionData.name, "", {
+		...ctx.context.authCookies.sessionData.options,
 		maxAge: 0,
 	});
-	ctx.setCookie(ctx.context.authCookies.dontRememberToken.name, "", {
-		maxAge: 0,
-	});
+	if (!skipDontRememberMe) {
+		ctx.setCookie(ctx.context.authCookies.dontRememberToken.name, "", {
+			...ctx.context.authCookies.dontRememberToken.options,
+			maxAge: 0,
+		});
+	}
 }
 
 export function parseCookies(cookieHeader: string) {
@@ -188,5 +245,71 @@ export function parseCookies(cookieHeader: string) {
 }
 
 export type EligibleCookies = (string & {}) | (keyof BetterAuthCookies & {});
+
+export const getSessionCookie = (
+	request: Request | Headers,
+	config?: {
+		cookiePrefix?: string;
+		cookieName?: string;
+		path?: string;
+	},
+) => {
+	if (config?.cookiePrefix) {
+		if (config.cookieName) {
+			config.cookiePrefix = `${config.cookiePrefix}-`;
+		} else {
+			config.cookiePrefix = `${config.cookiePrefix}.`;
+		}
+	}
+	const headers = "headers" in request ? request.headers : request;
+	const req = request instanceof Request ? request : undefined;
+	const url = getBaseURL(req?.url, config?.path, req);
+	const cookies = headers.get("cookie");
+	if (!cookies) {
+		return null;
+	}
+	const { cookieName = "session_token", cookiePrefix = "better-auth." } =
+		config || {};
+	const name = `${cookiePrefix}${cookieName}`;
+	const secureCookieName = `__Secure-${name}`;
+	const parsedCookie = parseCookies(cookies);
+	const sessionToken =
+		parsedCookie.get(name) || parsedCookie.get(secureCookieName);
+	if (sessionToken) {
+		return sessionToken;
+	}
+
+	return null;
+};
+
+export const getCookieCache = <
+	Session extends {
+		session: Session & Record<string, any>;
+		user: User & Record<string, any>;
+	},
+>(
+	request: Request | Headers,
+	config?: {
+		cookiePrefix?: string;
+		cookieName?: string;
+	},
+) => {
+	const headers = request instanceof Headers ? request : request.headers;
+	const cookies = headers.get("cookie");
+	if (!cookies) {
+		return null;
+	}
+	const { cookieName = "session_data", cookiePrefix = "better-auth" } =
+		config || {};
+	const name = isProduction
+		? `__Secure-${cookiePrefix}.${cookieName}`
+		: `${cookiePrefix}.${cookieName}`;
+	const parsedCookie = parseCookies(cookies);
+	const sessionData = parsedCookie.get(name);
+	if (sessionData) {
+		return safeJSONParse<Session>(sessionData);
+	}
+	return null;
+};
 
 export * from "./cookie-utils";

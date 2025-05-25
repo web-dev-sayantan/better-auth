@@ -1,9 +1,14 @@
 import type { ProviderOptions } from "../oauth2";
-import { validateAuthorizationCode, createAuthorizationURL } from "../oauth2";
+import {
+	validateAuthorizationCode,
+	createAuthorizationURL,
+	refreshAccessToken,
+} from "../oauth2";
 import type { OAuthProvider } from "../oauth2";
 import { betterFetch } from "@better-fetch/fetch";
-import { parseJWT } from "oslo/jwt";
 import { logger } from "../utils/logger";
+import { decodeJwt } from "jose";
+import { base64 } from "@better-auth/utils/base64";
 
 export interface MicrosoftEntraIDProfile extends Record<string, any> {
 	sub: string;
@@ -12,7 +17,8 @@ export interface MicrosoftEntraIDProfile extends Record<string, any> {
 	picture: string;
 }
 
-export interface MicrosoftOptions extends ProviderOptions {
+export interface MicrosoftOptions
+	extends ProviderOptions<MicrosoftEntraIDProfile> {
 	/**
 	 * The tenant ID of the Microsoft account
 	 * @default "common"
@@ -37,9 +43,11 @@ export const microsoft = (options: MicrosoftOptions) => {
 		id: "microsoft",
 		name: "Microsoft EntraID",
 		createAuthorizationURL(data) {
-			const scopes = data.scopes || ["openid", "profile", "email", "User.Read"];
+			const scopes = options.disableDefaultScope
+				? []
+				: ["openid", "profile", "email", "User.Read"];
 			options.scope && scopes.push(...options.scope);
-
+			data.scopes && scopes.push(...scopes);
 			return createAuthorizationURL({
 				id: "microsoft",
 				options,
@@ -48,22 +56,26 @@ export const microsoft = (options: MicrosoftOptions) => {
 				codeVerifier: data.codeVerifier,
 				scopes,
 				redirectURI: data.redirectURI,
+				prompt: options.prompt,
 			});
 		},
 		validateAuthorizationCode({ code, codeVerifier, redirectURI }) {
 			return validateAuthorizationCode({
 				code,
 				codeVerifier,
-				redirectURI: options.redirectURI || redirectURI,
+				redirectURI,
 				options,
 				tokenEndpoint,
 			});
 		},
 		async getUserInfo(token) {
+			if (options.getUserInfo) {
+				return options.getUserInfo(token);
+			}
 			if (!token.idToken) {
 				return null;
 			}
-			const user = parseJWT(token.idToken)?.payload as MicrosoftEntraIDProfile;
+			const user = decodeJwt(token.idToken) as MicrosoftEntraIDProfile;
 			const profilePhotoSize = options.profilePhotoSize || 48;
 			await betterFetch<ArrayBuffer>(
 				`https://graph.microsoft.com/v1.0/me/photos/${profilePhotoSize}x${profilePhotoSize}/$value`,
@@ -78,15 +90,20 @@ export const microsoft = (options: MicrosoftOptions) => {
 						try {
 							const response = context.response.clone();
 							const pictureBuffer = await response.arrayBuffer();
-							const pictureBase64 =
-								Buffer.from(pictureBuffer).toString("base64");
+							const pictureBase64 = base64.encode(pictureBuffer);
 							user.picture = `data:image/jpeg;base64, ${pictureBase64}`;
 						} catch (e) {
-							logger.error(e);
+							logger.error(
+								e && typeof e === "object" && "name" in e
+									? (e.name as string)
+									: "",
+								e,
+							);
 						}
 					},
 				},
 			);
+			const userMap = await options.mapProfileToUser?.(user);
 			return {
 				user: {
 					id: user.sub,
@@ -94,9 +111,24 @@ export const microsoft = (options: MicrosoftOptions) => {
 					email: user.email,
 					image: user.picture,
 					emailVerified: true,
+					...userMap,
 				},
 				data: user,
 			};
 		},
+		refreshAccessToken: options.refreshAccessToken
+			? options.refreshAccessToken
+			: async (refreshToken) => {
+					return refreshAccessToken({
+						refreshToken,
+						options: {
+							clientId: options.clientId,
+							clientKey: options.clientKey,
+							clientSecret: options.clientSecret,
+						},
+						tokenEndpoint,
+					});
+				},
+		options,
 	} satisfies OAuthProvider;
 };

@@ -14,7 +14,7 @@
     <a href="https://better-auth.com"><strong>Learn more »</strong></a>
     <br />
     <br />
-    <a href="https://discord.com/invite/GYC3W7tZzb">Discord</a>
+    <a href="https://discord.gg/better-auth">Discord</a>
     ·
     <a href="https://better-auth.com">Website</a>
     ·
@@ -25,10 +25,6 @@
 [![npm version](https://img.shields.io/npm/v/better-auth.svg)](https://www.npmjs.com/package/better-auth)
 [![GitHub stars](https://img.shields.io/github/stars/better-auth/better-auth)](https://github.com/better-auth/better-auth/stargazers)
 </p>
-
-
-> [!WARNING]
-> 🚧 This project is in beta and not yet recommended for production use. For more details, check out our [roadmap](https://github.com/orgs/better-auth/projects/2) to the v1 stable release.
 
 ## About the Project
 

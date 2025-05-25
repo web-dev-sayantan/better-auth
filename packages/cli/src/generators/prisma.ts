@@ -25,14 +25,42 @@ export const generatePrismaSchema: SchemaGenerator = async ({
 		schemaPrisma = getNewPrisma(provider);
 	}
 
+	// Create a map to store many-to-many relationships
+	const manyToManyRelations = new Map();
+
+	// First pass: identify many-to-many relationships
+	for (const table in tables) {
+		const fields = tables[table]?.fields;
+		for (const field in fields) {
+			const attr = fields[field]!;
+			if (attr.references) {
+				const referencedModel = capitalizeFirstLetter(attr.references.model);
+				if (!manyToManyRelations.has(referencedModel)) {
+					manyToManyRelations.set(referencedModel, new Set());
+				}
+				manyToManyRelations
+					.get(referencedModel)
+					.add(capitalizeFirstLetter(table));
+			}
+		}
+	}
+
 	const schema = produceSchema(schemaPrisma, (builder) => {
 		for (const table in tables) {
 			const fields = tables[table]?.fields;
-			const originalTable = tables[table]?.tableName;
-			const tableName = capitalizeFirstLetter(originalTable || "");
-			function getType(type: FieldType, isOptional: boolean) {
+			const originalTable = tables[table]?.modelName;
+			const modelName = capitalizeFirstLetter(originalTable || "");
+
+			function getType({
+				isBigint,
+				isOptional,
+				type,
+			}: { type: FieldType; isOptional: boolean; isBigint: boolean }) {
 				if (type === "string") {
 					return isOptional ? "String?" : "String";
+				}
+				if (type === "number" && isBigint) {
+					return isOptional ? "BigInt?" : "BigInt";
 				}
 				if (type === "number") {
 					return isOptional ? "Int?" : "Int";
@@ -50,18 +78,29 @@ export const generatePrismaSchema: SchemaGenerator = async ({
 					return isOptional ? "Int[]" : "Int[]";
 				}
 			}
+
 			const prismaModel = builder.findByType("model", {
-				name: tableName,
+				name: modelName,
 			});
+
 			if (!prismaModel) {
 				if (provider === "mongodb") {
+					// Mongo DB doesn't support auto increment, so just use their normal _id.
 					builder
-						.model(tableName)
+						.model(modelName)
 						.field("id", "String")
 						.attribute("id")
 						.attribute(`map("_id")`);
 				} else {
-					builder.model(tableName).field("id", "String").attribute("id");
+					if (options.advanced?.database?.useNumberId) {
+						builder
+							.model(modelName)
+							.field("id", "Int")
+							.attribute("id")
+							.attribute("default(autoincrement())");
+					} else {
+						builder.model(modelName).field("id", "String").attribute("id");
+					}
 				}
 			}
 
@@ -78,36 +117,83 @@ export const generatePrismaSchema: SchemaGenerator = async ({
 					}
 				}
 
-				builder
-					.model(tableName)
-					.field(field, getType(attr.type, !attr?.required));
+				builder.model(modelName).field(
+					field,
+					field === "id" && options.advanced?.database?.useNumberId
+						? getType({
+								isBigint: false,
+								isOptional: false,
+								type: "number",
+							})
+						: getType({
+								isBigint: attr?.bigint || false,
+								isOptional: !attr?.required,
+								type:
+									attr.references?.field === "id"
+										? options.advanced?.database?.useNumberId
+											? "number"
+											: "string"
+										: attr.type,
+							}),
+				);
 				if (attr.unique) {
-					builder.model(tableName).blockAttribute(`unique([${field}])`);
+					builder.model(modelName).blockAttribute(`unique([${field}])`);
 				}
 				if (attr.references) {
+					let action = "Cascade";
+					if (attr.references.onDelete === "no action") action = "NoAction";
+					else if (attr.references.onDelete === "set null") action = "SetNull";
+					else if (attr.references.onDelete === "set default")
+						action = "SetDefault";
+					else if (attr.references.onDelete === "restrict") action = "Restrict";
 					builder
-						.model(tableName)
+						.model(modelName)
 						.field(
 							`${attr.references.model.toLowerCase()}`,
 							capitalizeFirstLetter(attr.references.model),
 						)
 						.attribute(
-							`relation(fields: [${field}], references: [${attr.references.field}], onDelete: Cascade)`,
+							`relation(fields: [${field}], references: [${attr.references.field}], onDelete: ${action})`,
 						);
 				}
+				if (
+					!attr.unique &&
+					!attr.references &&
+					provider === "mysql" &&
+					attr.type === "string"
+				) {
+					builder.model(modelName).field(field).attribute("db.Text");
+				}
 			}
+
+			// Add many-to-many fields
+			if (manyToManyRelations.has(modelName)) {
+				for (const relatedModel of manyToManyRelations.get(modelName)) {
+					const fieldName = `${relatedModel.toLowerCase()}s`;
+					const existingField = builder.findByType("field", {
+						name: fieldName,
+						within: prismaModel?.properties,
+					});
+					if (!existingField) {
+						builder.model(modelName).field(fieldName, `${relatedModel}[]`);
+					}
+				}
+			}
+
 			const hasAttribute = builder.findByType("attribute", {
 				name: "map",
 				within: prismaModel?.properties,
 			});
-			if (originalTable !== tableName && !hasAttribute) {
-				builder.model(tableName).blockAttribute("map", originalTable);
+			if (originalTable !== modelName && !hasAttribute) {
+				builder.model(modelName).blockAttribute("map", originalTable);
 			}
 		}
 	});
+
 	return {
 		code: schema.trim() === schemaPrisma.trim() ? "" : schema,
 		fileName: filePath,
+		overwrite: true,
 	};
 };
 

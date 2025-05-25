@@ -188,3 +188,9 @@ dist
 
 android/
 .expo/
+
+
+.vercel
+.vinxi
+# Turborepo
+.turbo

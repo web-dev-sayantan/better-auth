@@ -1,4 +1,4 @@
-import { APIError, type Endpoint, createRouter, statusCode } from "better-call";
+import { APIError, type Middleware, createRouter } from "better-call";
 import type { AuthContext } from "../init";
 import type { BetterAuthOptions } from "../types";
 import type { UnionToIntersection } from "../types/helper";
@@ -25,6 +25,11 @@ import {
 	deleteUser,
 	setPassword,
 	updateUser,
+	deleteUserCallback,
+	unlinkAccount,
+	refreshToken,
+	getAccessToken,
+	accountInfo,
 } from "./routes";
 import { ok } from "./routes/ok";
 import { signUpEmail } from "./routes/sign-up";
@@ -32,6 +37,7 @@ import { error } from "./routes/error";
 import { logger } from "../utils/logger";
 import type { BetterAuthPlugin } from "../plugins";
 import { onRequestRateLimit } from "./rate-limiter";
+import { toAuthEndpoints } from "./to-auth-endpoints";
 
 export function getEndpoints<
 	C extends AuthContext,
@@ -71,10 +77,8 @@ export function getEndpoints<
 								...context.context,
 							},
 						});
-					}) as Endpoint;
-					middleware.path = m.path;
+					}) as Middleware;
 					middleware.options = m.middleware.options;
-					middleware.headers = m.middleware.headers;
 					return {
 						path: m.path,
 						middleware,
@@ -107,6 +111,11 @@ export function getEndpoints<
 		revokeOtherSessions,
 		linkSocialAccount,
 		listUserAccounts,
+		deleteUserCallback,
+		unlinkAccount,
+		refreshToken,
+		getAccessToken,
+		accountInfo,
 	};
 	const endpoints = {
 		...baseEndpoints,
@@ -114,125 +123,12 @@ export function getEndpoints<
 		ok,
 		error,
 	};
-	let api: Record<string, any> = {};
-	for (const [key, value] of Object.entries(endpoints)) {
-		api[key] = async (context = {} as any) => {
-			let c = await ctx;
-			for (const plugin of options.plugins || []) {
-				if (plugin.hooks?.before) {
-					for (const hook of plugin.hooks.before) {
-						const ctx = {
-							...value,
-							...context,
-							context: {
-								...c,
-								...context?.context,
-							},
-						};
-						const match = hook.matcher(ctx);
-						if (match) {
-							const hookRes = await hook.handler(ctx);
-							if (hookRes && "context" in hookRes) {
-								context = {
-									...hookRes,
-									...context,
-								};
-							}
-						}
-					}
-				}
-			}
-			let endpointRes: any;
-			try {
-				//@ts-ignore
-				endpointRes = await value({
-					...context,
-					context: {
-						...c,
-						...context.context,
-					},
-				});
-			} catch (e) {
-				if (e instanceof APIError) {
-					const afterPlugins = options.plugins
-						?.map((plugin) => {
-							if (plugin.hooks?.after) {
-								return plugin.hooks.after;
-							}
-						})
-						.filter((plugin) => plugin !== undefined)
-						.flat();
-
-					if (!afterPlugins?.length) {
-						throw e;
-					}
-
-					let response = new Response(JSON.stringify(e.body), {
-						status: statusCode[e.status],
-						headers: e.headers,
-					});
-
-					let pluginResponse: Request | undefined = undefined;
-
-					for (const hook of afterPlugins || []) {
-						const match = hook.matcher(context);
-						if (match) {
-							// @ts-expect-error - returned is not in the context type
-							c.returned = response;
-							const ctx = {
-								...value,
-								...context,
-								context: c,
-							};
-							const hookRes = await hook.handler(ctx);
-							if (hookRes && "response" in hookRes) {
-								pluginResponse = hookRes.response as any;
-							}
-						}
-					}
-					if (pluginResponse instanceof Response) {
-						return pluginResponse;
-					}
-					throw e;
-				}
-				throw e;
-			}
-			let response = endpointRes;
-			for (const plugin of options.plugins || []) {
-				if (plugin.hooks?.after) {
-					for (const hook of plugin.hooks.after) {
-						const ctx = {
-							...context,
-							context: {
-								...c,
-								...context.context,
-								endpoint: value,
-								returned: response,
-							},
-						};
-						const match = hook.matcher(ctx);
-						if (match) {
-							const hookRes = await hook.handler(ctx);
-							if (hookRes && "response" in hookRes) {
-								response = hookRes.response as any;
-							}
-						}
-					}
-				}
-			}
-			return response;
-		};
-		api[key].path = value.path;
-		api[key].method = value.method;
-		api[key].options = value.options;
-		api[key].headers = value.headers;
-	}
+	const api = toAuthEndpoints(endpoints, ctx);
 	return {
 		api: api as typeof endpoints & PluginEndpoint,
 		middlewares,
 	};
 }
-
 export const router = <C extends AuthContext, Option extends BetterAuthOptions>(
 	ctx: C,
 	options: Option,
@@ -241,7 +137,10 @@ export const router = <C extends AuthContext, Option extends BetterAuthOptions>(
 	const basePath = new URL(ctx.baseURL).pathname;
 
 	return createRouter(api, {
-		extraContext: ctx,
+		routerContext: ctx,
+		openapi: {
+			disabled: true,
+		},
 		basePath,
 		routerMiddleware: [
 			{
@@ -251,6 +150,12 @@ export const router = <C extends AuthContext, Option extends BetterAuthOptions>(
 			...middlewares,
 		],
 		async onRequest(req) {
+			//handle disabled paths
+			const disabledPaths = ctx.options.disabledPaths || [];
+			const path = new URL(req.url).pathname.replace(basePath, "");
+			if (disabledPaths.includes(path)) {
+				return new Response("Not Found", { status: 404 });
+			}
 			for (const plugin of ctx.options.plugins || []) {
 				if (plugin.onRequest) {
 					const response = await plugin.onRequest(req, ctx);
@@ -273,6 +178,9 @@ export const router = <C extends AuthContext, Option extends BetterAuthOptions>(
 			return res;
 		},
 		onError(e) {
+			if (e instanceof APIError && e.status === "FOUND") {
+				return;
+			}
 			if (options.onAPIError?.throw) {
 				throw e;
 			}
@@ -281,15 +189,42 @@ export const router = <C extends AuthContext, Option extends BetterAuthOptions>(
 				return;
 			}
 
-			const log = options.logger?.verboseLogging ? logger : undefined;
+			const optLogLevel = options.logger?.level;
+			const log =
+				optLogLevel === "error" ||
+				optLogLevel === "warn" ||
+				optLogLevel === "debug"
+					? logger
+					: undefined;
 			if (options.logger?.disabled !== true) {
+				if (
+					e &&
+					typeof e === "object" &&
+					"message" in e &&
+					typeof e.message === "string"
+				) {
+					if (
+						e.message.includes("no column") ||
+						e.message.includes("column") ||
+						e.message.includes("relation") ||
+						e.message.includes("table") ||
+						e.message.includes("does not exist")
+					) {
+						ctx.logger?.error(e.message);
+						return;
+					}
+				}
+
 				if (e instanceof APIError) {
 					if (e.status === "INTERNAL_SERVER_ERROR") {
-						logger.error(e);
+						ctx.logger.error(e.status, e);
 					}
 					log?.error(e.message);
 				} else {
-					logger?.error(e);
+					ctx.logger?.error(
+						e && typeof e === "object" && "name" in e ? (e.name as string) : "",
+						e,
+					);
 				}
 			}
 		},

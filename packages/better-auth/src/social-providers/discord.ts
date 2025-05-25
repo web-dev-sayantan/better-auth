@@ -1,7 +1,6 @@
 import { betterFetch } from "@better-fetch/fetch";
 import type { OAuthProvider, ProviderOptions } from "../oauth2";
-import { validateAuthorizationCode } from "../oauth2";
-
+import { validateAuthorizationCode, refreshAccessToken } from "../oauth2";
 export interface DiscordProfile extends Record<string, any> {
 	/** the user's id (i.e. the numerical snowflake) */
 	id: string;
@@ -74,14 +73,17 @@ export interface DiscordProfile extends Record<string, any> {
 	image_url: string;
 }
 
-export interface DiscordOptions extends ProviderOptions {}
+export interface DiscordOptions extends ProviderOptions<DiscordProfile> {
+	prompt?: "none" | "consent";
+}
 
 export const discord = (options: DiscordOptions) => {
 	return {
 		id: "discord",
 		name: "Discord",
 		createAuthorizationURL({ state, scopes, redirectURI }) {
-			const _scopes = scopes || ["identify", "email"];
+			const _scopes = options.disableDefaultScope ? [] : ["identify", "email"];
+			scopes && _scopes.push(...scopes);
 			options.scope && _scopes.push(...options.scope);
 			return new URL(
 				`https://discord.com/api/oauth2/authorize?scope=${_scopes.join(
@@ -90,18 +92,34 @@ export const discord = (options: DiscordOptions) => {
 					options.clientId
 				}&redirect_uri=${encodeURIComponent(
 					options.redirectURI || redirectURI,
-				)}&state=${state}`,
+				)}&state=${state}&prompt=${options.prompt || "none"}`,
 			);
 		},
 		validateAuthorizationCode: async ({ code, redirectURI }) => {
 			return validateAuthorizationCode({
 				code,
-				redirectURI: options.redirectURI || redirectURI,
+				redirectURI,
 				options,
 				tokenEndpoint: "https://discord.com/api/oauth2/token",
 			});
 		},
+		refreshAccessToken: options.refreshAccessToken
+			? options.refreshAccessToken
+			: async (refreshToken) => {
+					return refreshAccessToken({
+						refreshToken,
+						options: {
+							clientId: options.clientId,
+							clientKey: options.clientKey,
+							clientSecret: options.clientSecret,
+						},
+						tokenEndpoint: "https://discord.com/api/oauth2/token",
+					});
+				},
 		async getUserInfo(token) {
+			if (options.getUserInfo) {
+				return options.getUserInfo(token);
+			}
 			const { data: profile, error } = await betterFetch<DiscordProfile>(
 				"https://discord.com/api/users/@me",
 				{
@@ -124,16 +142,19 @@ export const discord = (options: DiscordOptions) => {
 				const format = profile.avatar.startsWith("a_") ? "gif" : "png";
 				profile.image_url = `https://cdn.discordapp.com/avatars/${profile.id}/${profile.avatar}.${format}`;
 			}
+			const userMap = await options.mapProfileToUser?.(profile);
 			return {
 				user: {
 					id: profile.id,
-					name: profile.display_name || profile.username || "",
+					name: profile.global_name || profile.username || "",
 					email: profile.email,
 					emailVerified: profile.verified,
 					image: profile.image_url,
+					...userMap,
 				},
 				data: profile,
 			};
 		},
+		options,
 	} satisfies OAuthProvider<DiscordProfile>;
 };

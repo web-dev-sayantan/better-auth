@@ -1,4 +1,4 @@
-import type { Prettify } from "../types";
+import type { Prettify } from "../types/helper";
 import { apple } from "./apple";
 import { discord } from "./discord";
 import { facebook } from "./facebook";
@@ -11,7 +11,13 @@ import { twitter } from "./twitter";
 import { dropbox } from "./dropbox";
 import { linkedin } from "./linkedin";
 import { gitlab } from "./gitlab";
-
+import { tiktok } from "./tiktok";
+import { reddit } from "./reddit";
+import { roblox } from "./roblox";
+import { z } from "zod";
+import { vk } from "./vk";
+import { kick } from "./kick";
+import { zoom } from "./zoom";
 export const socialProviders = {
 	apple,
 	discord,
@@ -23,8 +29,14 @@ export const socialProviders = {
 	twitch,
 	twitter,
 	dropbox,
+	kick,
 	linkedin,
 	gitlab,
+	tiktok,
+	reddit,
+	roblox,
+	vk,
+	zoom,
 };
 
 export const socialProviderList = Object.keys(socialProviders) as [
@@ -32,13 +44,19 @@ export const socialProviderList = Object.keys(socialProviders) as [
 	...(keyof typeof socialProviders)[],
 ];
 
-export type SocialProviders = typeof socialProviders extends {
-	[key in infer K]: infer V;
-}
-	? V extends (options: infer V) => any
-		? Partial<Record<K, Prettify<V & { enabled?: boolean }>>>
-		: never
-	: never;
+export const SocialProviderListEnum = z
+	.enum(socialProviderList)
+	.or(z.string()) as z.ZodType<SocialProviderList[number] | (string & {})>;
+
+export type SocialProvider = z.infer<typeof SocialProviderListEnum>;
+
+export type SocialProviders = {
+	[K in SocialProviderList[number]]?: Prettify<
+		Parameters<(typeof socialProviders)[K]>[0] & {
+			enabled?: boolean;
+		}
+	>;
+};
 
 export * from "./github";
 export * from "./google";
@@ -52,5 +70,11 @@ export * from "./twitter";
 export * from "./dropbox";
 export * from "./linkedin";
 export * from "./gitlab";
+export * from "./tiktok";
+export * from "./reddit";
+export * from "./roblox";
+export * from "./vk";
+export * from "./zoom";
+export * from "./kick";
 
 export type SocialProviderList = typeof socialProviderList;

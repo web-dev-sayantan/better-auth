@@ -1,47 +1,21 @@
-import { HMAC, sha256 } from "oslo/crypto";
 import { constantTimeEqual } from "./buffer";
+import { createHash } from "@better-auth/utils/hash";
+import { base64 } from "@better-auth/utils/base64";
 
 export async function hashToBase64(
 	data: string | ArrayBuffer,
 ): Promise<string> {
-	const buffer = await sha256(
-		typeof data === "string" ? new TextEncoder().encode(data) : data,
-	);
-	return Buffer.from(buffer).toString("base64");
+	const buffer = await createHash("SHA-256").digest(data);
+	return base64.encode(buffer);
 }
 
 export async function compareHash(
 	data: string | ArrayBuffer,
 	hash: string,
 ): Promise<boolean> {
-	const buffer = await sha256(
+	const buffer = await createHash("SHA-256").digest(
 		typeof data === "string" ? new TextEncoder().encode(data) : data,
 	);
-	const hashBuffer = Buffer.from(hash, "base64");
+	const hashBuffer = base64.decode(hash);
 	return constantTimeEqual(buffer, hashBuffer);
 }
-
-async function signValue({ value, secret }: { value: string; secret: string }) {
-	const hmac = new HMAC("SHA-256");
-	return hmac
-		.sign(new TextEncoder().encode(secret), new TextEncoder().encode(value))
-		.then((buffer) => Buffer.from(buffer).toString("base64"));
-}
-
-function verifyValue({
-	value,
-	signature,
-	secret,
-}: { value: string; signature: string; secret: string }) {
-	const hmac = new HMAC("SHA-256");
-	return hmac.verify(
-		new TextEncoder().encode(secret),
-		Buffer.from(signature, "base64"),
-		new TextEncoder().encode(value),
-	);
-}
-
-export const hmac = {
-	sign: signValue,
-	verify: verifyValue,
-};

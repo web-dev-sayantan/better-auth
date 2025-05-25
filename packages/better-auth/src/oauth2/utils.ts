@@ -1,14 +1,12 @@
-import { sha256 } from "oslo/crypto";
-import { base64url } from "oslo/encoding";
 import type { OAuth2Tokens } from "./types";
 import { getDate } from "../utils/date";
+import { createHash } from "@better-auth/utils/hash";
+import { base64Url } from "@better-auth/utils/base64";
 
 export async function generateCodeChallenge(codeVerifier: string) {
-	const codeChallengeBytes = await sha256(
-		new TextEncoder().encode(codeVerifier),
-	);
-	return base64url.encode(new Uint8Array(codeChallengeBytes), {
-		includePadding: false,
+	const codeChallengeBytes = await createHash("SHA-256").digest(codeVerifier);
+	return base64Url.encode(new Uint8Array(codeChallengeBytes), {
+		padding: false,
 	});
 }
 
@@ -28,3 +26,6 @@ export function getOAuth2Tokens(data: Record<string, any>): OAuth2Tokens {
 		idToken: data.id_token,
 	};
 }
+
+export const encodeOAuthParameter = (value: string) =>
+	encodeURIComponent(value).replace(/%20/g, "+");

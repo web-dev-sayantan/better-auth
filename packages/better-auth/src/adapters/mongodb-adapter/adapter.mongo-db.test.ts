@@ -4,7 +4,6 @@ import { MongoClient } from "mongodb";
 import { runAdapterTest } from "../test";
 import { mongodbAdapter } from ".";
 import { getTestInstance } from "../../test-utils/test-instance";
-
 describe("adapter test", async () => {
 	const dbClient = async (connectionString: string, dbName: string) => {
 		const client = new MongoClient(connectionString);
@@ -26,7 +25,28 @@ describe("adapter test", async () => {
 
 	const adapter = mongodbAdapter(db);
 	await runAdapterTest({
-		adapter,
+		getAdapter: async (customOptions = {}) => {
+			return adapter({
+				user: {
+					fields: {
+						email: "email_address",
+					},
+					additionalFields: {
+						test: {
+							type: "string",
+							defaultValue: "test",
+						},
+					},
+				},
+				session: {
+					modelName: "sessions",
+				},
+				...customOptions,
+			});
+		},
+		disableTests: {
+			SHOULD_PREFER_GENERATE_ID_IF_PROVIDED: true,
+		},
 	});
 });
 
@@ -35,8 +55,8 @@ describe("simple-flow", async () => {
 		{},
 		{
 			disableTestUser: true,
+			testWith: "mongodb",
 		},
-		"mongodb",
 	);
 	const testUser = {
 		email: "test-eamil@email.com",
@@ -48,16 +68,14 @@ describe("simple-flow", async () => {
 		const user = await auth.api.signUpEmail({
 			body: testUser,
 		});
-		expect(user.user).toBeDefined();
-		expect(user.session).toBeDefined();
+		expect(user).toBeDefined();
 	});
 
 	it("should sign in", async () => {
 		const user = await auth.api.signInEmail({
 			body: testUser,
 		});
-		expect(user.user).toBeDefined();
-		expect(user.session).toBeDefined();
+		expect(user).toBeDefined();
 	});
 
 	it("should get session", async () => {

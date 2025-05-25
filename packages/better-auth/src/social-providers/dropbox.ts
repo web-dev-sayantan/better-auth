@@ -1,6 +1,10 @@
 import { betterFetch } from "@better-fetch/fetch";
 import type { OAuthProvider, ProviderOptions } from "../oauth2";
-import { createAuthorizationURL, validateAuthorizationCode } from "../oauth2";
+import {
+	createAuthorizationURL,
+	refreshAccessToken,
+	validateAuthorizationCode,
+} from "../oauth2";
 
 export interface DropboxProfile {
 	account_id: string;
@@ -16,7 +20,7 @@ export interface DropboxProfile {
 	profile_photo_url: string;
 }
 
-export interface DropboxOptions extends ProviderOptions {}
+export interface DropboxOptions extends ProviderOptions<DropboxProfile> {}
 
 export const dropbox = (options: DropboxOptions) => {
 	const tokenEndpoint = "https://api.dropboxapi.com/oauth2/token";
@@ -30,8 +34,9 @@ export const dropbox = (options: DropboxOptions) => {
 			codeVerifier,
 			redirectURI,
 		}) => {
-			const _scopes = scopes || ["account_info.read"];
+			const _scopes = options.disableDefaultScope ? [] : ["account_info.read"];
 			options.scope && _scopes.push(...options.scope);
+			scopes && _scopes.push(...scopes);
 			return await createAuthorizationURL({
 				id: "dropbox",
 				options,
@@ -46,12 +51,28 @@ export const dropbox = (options: DropboxOptions) => {
 			return await validateAuthorizationCode({
 				code,
 				codeVerifier,
-				redirectURI: options.redirectURI || redirectURI,
+				redirectURI,
 				options,
 				tokenEndpoint,
 			});
 		},
+		refreshAccessToken: options.refreshAccessToken
+			? options.refreshAccessToken
+			: async (refreshToken) => {
+					return refreshAccessToken({
+						refreshToken,
+						options: {
+							clientId: options.clientId,
+							clientKey: options.clientKey,
+							clientSecret: options.clientSecret,
+						},
+						tokenEndpoint: "https://api.dropbox.com/oauth2/token",
+					});
+				},
 		async getUserInfo(token) {
+			if (options.getUserInfo) {
+				return options.getUserInfo(token);
+			}
 			const { data: profile, error } = await betterFetch<DropboxProfile>(
 				"https://api.dropboxapi.com/2/users/get_current_account",
 				{
@@ -65,7 +86,7 @@ export const dropbox = (options: DropboxOptions) => {
 			if (error) {
 				return null;
 			}
-
+			const userMap = await options.mapProfileToUser?.(profile);
 			return {
 				user: {
 					id: profile.account_id,
@@ -73,9 +94,11 @@ export const dropbox = (options: DropboxOptions) => {
 					email: profile.email,
 					emailVerified: profile.email_verified || false,
 					image: profile.profile_photo_url,
+					...userMap,
 				},
 				data: profile,
 			};
 		},
+		options,
 	} satisfies OAuthProvider<DropboxProfile>;
 };

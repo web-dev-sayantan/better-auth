@@ -2,14 +2,15 @@ import { describe, expect, it, vi } from "vitest";
 import { getTestInstance } from "../../test-utils/test-instance";
 import { parseSetCookieHeader } from "../../cookies";
 import { getDate } from "../../utils/date";
-import type { Session } from "../../types";
 import { memoryAdapter, type MemoryDB } from "../../adapters/memory-adapter";
 
 describe("session", async () => {
-	const { client, testUser, sessionSetter } = await getTestInstance();
+	const { client, testUser, sessionSetter, cookieSetter, auth } =
+		await getTestInstance();
 
 	it("should set cookies correctly on sign in", async () => {
-		const res = await client.signIn.email(
+		const headers = new Headers();
+		await client.signIn.email(
 			{
 				email: testUser.email,
 				password: testUser.password,
@@ -18,17 +19,24 @@ describe("session", async () => {
 				onSuccess(context) {
 					const header = context.response.headers.get("set-cookie");
 					const cookies = parseSetCookieHeader(header || "");
-					expect(cookies.get("better-auth.session_token")).toMatchObject({
+					cookieSetter(headers)(context);
+					const cookie = cookies.get("better-auth.session_token");
+					expect(cookie).toMatchObject({
 						value: expect.any(String),
-						"max-age": (60 * 60 * 24 * 7).toString(),
+						"max-age": 60 * 60 * 24 * 7,
 						path: "/",
-						httponly: true,
 						samesite: "lax",
+						httponly: true,
 					});
 				},
 			},
 		);
-		const expiresAt = new Date(res.data?.session?.expiresAt || "");
+		const { data } = await client.getSession({
+			fetchOptions: {
+				headers,
+			},
+		});
+		const expiresAt = new Date(data?.session.expiresAt || "");
 		const now = new Date();
 
 		expect(expiresAt.getTime()).toBeGreaterThan(
@@ -41,10 +49,16 @@ describe("session", async () => {
 		expect(response.data).toBeNull();
 	});
 
-	it("should update session when close to expiry", async () => {
+	it("should update session when update age is reached", async () => {
+		const { client, testUser } = await getTestInstance({
+			session: {
+				updateAge: 60,
+				expiresIn: 60 * 2,
+			},
+		});
 		let headers = new Headers();
 
-		const res = await client.signIn.email(
+		await client.signIn.email(
 			{
 				email: testUser.email,
 				password: testUser.password,
@@ -59,30 +73,78 @@ describe("session", async () => {
 			},
 		);
 
-		if (!res.data?.session) {
+		const data = await client.getSession({
+			fetchOptions: {
+				headers,
+				throw: true,
+			},
+		});
+
+		if (!data) {
 			throw new Error("No session found");
 		}
-		const after7Days = new Date();
-		after7Days.setDate(after7Days.getDate() + 6);
-		expect(
-			new Date(res.data?.session.expiresAt).getTime(),
-		).toBeGreaterThanOrEqual(after7Days.getTime());
+		expect(new Date(data?.session.expiresAt).getTime()).toBeGreaterThan(
+			new Date(Date.now() + 1000 * 2 * 59).getTime(),
+		);
 
-		const nearExpiryDate = new Date();
-		nearExpiryDate.setDate(nearExpiryDate.getDate() + 6);
-		vi.setSystemTime(nearExpiryDate);
-		const response = await client.getSession({
+		expect(new Date(data?.session.expiresAt).getTime()).toBeLessThan(
+			new Date(Date.now() + 1000 * 2 * 60).getTime(),
+		);
+		for (const t of [60, 80, 100, 121]) {
+			const span = new Date();
+			span.setSeconds(span.getSeconds() + t);
+			vi.setSystemTime(span);
+			const response = await client.getSession({
+				fetchOptions: {
+					headers,
+					onSuccess(context) {
+						const parsed = parseSetCookieHeader(
+							context.response.headers.get("set-cookie") || "",
+						);
+						const maxAge = parsed.get("better-auth.session_token")?.["max-age"];
+						expect(maxAge).toBe(t === 121 ? 0 : 60 * 2);
+					},
+				},
+			});
+			if (t === 121) {
+				//expired
+				expect(response.data).toBeNull();
+			} else {
+				expect(
+					new Date(response.data?.session.expiresAt!).getTime(),
+				).toBeGreaterThan(new Date(Date.now() + 1000 * 2 * 59).getTime());
+			}
+		}
+		vi.useRealTimers();
+	});
+
+	it("should update the session every time when set to 0", async () => {
+		const { client, signInWithTestUser } = await getTestInstance({
+			session: {
+				updateAge: 0,
+			},
+		});
+		const { headers } = await signInWithTestUser();
+
+		const session = await client.getSession({
 			fetchOptions: {
 				headers,
 			},
 		});
-		if (!response.data?.session) {
-			throw new Error("No session found");
-		}
-		nearExpiryDate.setDate(nearExpiryDate.getDate() + 7);
+
+		vi.useFakeTimers();
+		await vi.advanceTimersByTimeAsync(1000 * 60 * 5);
+		const session2 = await client.getSession({
+			fetchOptions: {
+				headers,
+			},
+		});
+		expect(session2.data?.session.expiresAt).not.toBe(
+			session.data?.session.expiresAt,
+		);
 		expect(
-			new Date(response.data?.session?.expiresAt).getTime(),
-		).toBeGreaterThanOrEqual(nearExpiryDate.getTime());
+			new Date(session2.data!.session.expiresAt).getTime(),
+		).toBeGreaterThan(new Date(session.data!.session.expiresAt).getTime());
 	});
 
 	it("should handle 'don't remember me' option", async () => {
@@ -108,10 +170,16 @@ describe("session", async () => {
 				},
 			},
 		);
-		if (!res.data?.session) {
+		const data = await client.getSession({
+			fetchOptions: {
+				headers,
+				throw: true,
+			},
+		});
+		if (!data) {
 			throw new Error("No session found");
 		}
-		const expiresAt = res.data.session.expiresAt;
+		const expiresAt = data.session.expiresAt;
 		expect(new Date(expiresAt).valueOf()).toBeLessThanOrEqual(
 			getDate(1000 * 60 * 60 * 24).valueOf(),
 		);
@@ -131,7 +199,8 @@ describe("session", async () => {
 	});
 
 	it("should set cookies correctly on sign in after changing config", async () => {
-		const res = await client.signIn.email(
+		const headers = new Headers();
+		await client.signIn.email(
 			{
 				email: testUser.email,
 				password: testUser.password,
@@ -142,15 +211,30 @@ describe("session", async () => {
 					const cookies = parseSetCookieHeader(header || "");
 					expect(cookies.get("better-auth.session_token")).toMatchObject({
 						value: expect.any(String),
-						"max-age": (60 * 60 * 24 * 7).toString(),
+						"max-age": 60 * 60 * 24 * 7,
 						path: "/",
 						httponly: true,
 						samesite: "lax",
 					});
+					headers.set(
+						"cookie",
+						`better-auth.session_token=${
+							cookies.get("better-auth.session_token")?.value
+						}`,
+					);
 				},
 			},
 		);
-		const expiresAt = new Date(res.data?.session?.expiresAt || "");
+		const data = await client.getSession({
+			fetchOptions: {
+				headers,
+				throw: true,
+			},
+		});
+		if (!data) {
+			throw new Error("No session found");
+		}
+		const expiresAt = new Date(data?.session?.expiresAt || "");
 		const now = new Date();
 
 		expect(expiresAt.getTime()).toBeGreaterThan(
@@ -174,10 +258,14 @@ describe("session", async () => {
 				},
 			},
 		);
-		if (!res.data?.session) {
-			throw new Error("No session found");
-		}
-		expect(res.data.session).not.toBeNull();
+		const data = await client.getSession({
+			fetchOptions: {
+				headers,
+				throw: true,
+			},
+		});
+
+		expect(data).not.toBeNull();
 		await client.signOut({
 			fetchOptions: {
 				headers,
@@ -229,18 +317,24 @@ describe("session", async () => {
 				onSuccess: sessionSetter(headers2),
 			},
 		});
+		const session = await client.getSession({
+			fetchOptions: {
+				headers,
+				throw: true,
+			},
+		});
 		await client.revokeSession({
 			fetchOptions: {
 				headers,
 			},
-			id: res.data?.session?.id || "",
+			token: session?.session?.token || "",
 		});
-		const session = await client.getSession({
+		const newSession = await client.getSession({
 			fetchOptions: {
 				headers,
 			},
 		});
-		expect(session.data).toBeNull();
+		expect(newSession.data).toBeNull();
 		const revokeRes = await client.revokeSessions({
 			fetchOptions: {
 				headers: headers2,
@@ -281,20 +375,20 @@ describe("session storage", async () => {
 		});
 		expect(session.data).toMatchObject({
 			session: {
-				id: expect.any(String),
 				userId: expect.any(String),
-				expiresAt: expect.any(String),
+				token: expect.any(String),
+				expiresAt: expect.any(Date),
 				ipAddress: expect.any(String),
 				userAgent: expect.any(String),
 			},
 			user: {
 				id: expect.any(String),
-				name: "test",
+				name: "test user",
 				email: "test@test.com",
 				emailVerified: false,
 				image: null,
-				createdAt: expect.any(String),
-				updatedAt: expect.any(String),
+				createdAt: expect.any(Date),
+				updatedAt: expect.any(Date),
 			},
 		});
 	});
@@ -321,7 +415,7 @@ describe("session storage", async () => {
 			fetchOptions: {
 				headers,
 			},
-			id: session.data?.session?.id || "",
+			token: session.data?.session?.token || "",
 		});
 		const revokedSession = await client.getSession({
 			fetchOptions: {
@@ -340,17 +434,29 @@ describe("cookie cache", async () => {
 		verification: [],
 	};
 	const adapter = memoryAdapter(database);
-	const fn = vi.spyOn(adapter, "findOne");
-	const { client, testUser } = await getTestInstance({
+
+	const { client, testUser, auth, cookieSetter } = await getTestInstance({
 		database: adapter,
 		session: {
+			additionalFields: {
+				sensitiveData: {
+					type: "string",
+					returned: false,
+					defaultValue: "sensitive-data",
+				},
+			},
 			cookieCache: {
 				enabled: true,
 			},
 		},
 	});
+	const ctx = await auth.$context;
+
+	it("should cache cookies", async () => {});
+	const fn = vi.spyOn(ctx.adapter, "findOne");
+
+	const headers = new Headers();
 	it("should cache cookies", async () => {
-		const headers = new Headers();
 		await client.signIn.email(
 			{
 				email: testUser.email,
@@ -371,13 +477,70 @@ describe("cookie cache", async () => {
 				},
 			},
 		);
-		expect(fn).toHaveBeenCalledTimes(2);
+		expect(fn).toHaveBeenCalledTimes(1);
 		const session = await client.getSession({
 			fetchOptions: {
 				headers,
 			},
 		});
+		expect(session.data?.session).not.toHaveProperty("sensitiveData");
 		expect(session.data).not.toBeNull();
-		expect(fn).toHaveBeenCalledTimes(2);
+		expect(fn).toHaveBeenCalledTimes(1);
+	});
+
+	it("should disable cookie cache", async () => {
+		const ctx = await auth.$context;
+
+		const s = await client.getSession({
+			fetchOptions: {
+				headers,
+			},
+		});
+		expect(s.data?.user.emailVerified).toBe(false);
+		await ctx.internalAdapter.updateUser(s.data?.user.id || "", {
+			emailVerified: true,
+		});
+		expect(fn).toHaveBeenCalledTimes(1);
+
+		const session = await client.getSession({
+			query: {
+				disableCookieCache: true,
+			},
+			fetchOptions: {
+				headers,
+			},
+		});
+		expect(session.data?.user.emailVerified).toBe(true);
+		expect(session.data).not.toBeNull();
+		expect(fn).toHaveBeenCalledTimes(3);
+	});
+
+	it("should reset cache when expires", async () => {
+		expect(fn).toHaveBeenCalledTimes(3);
+		await client.getSession({
+			fetchOptions: {
+				headers,
+			},
+		});
+		vi.useFakeTimers();
+		await vi.advanceTimersByTimeAsync(1000 * 60 * 10); // 10 minutes
+		await client.getSession({
+			fetchOptions: {
+				headers,
+				onSuccess(context) {
+					cookieSetter(headers)(context);
+				},
+			},
+		});
+		expect(fn).toHaveBeenCalledTimes(5);
+		await client.getSession({
+			fetchOptions: {
+				headers,
+				onSuccess(context) {
+					cookieSetter(headers)(context);
+				},
+			},
+		});
+		expect(fn).toHaveBeenCalledTimes(5);
 	});
 });

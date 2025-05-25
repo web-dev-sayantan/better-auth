@@ -1,16 +1,28 @@
 import type { Dialect, Kysely, MysqlPool, PostgresPool } from "kysely";
-import type { Account, Session, User, Verification } from "../db/schema";
+import type {
+	Account,
+	GenericEndpointContext,
+	Session,
+	User,
+	Verification,
+} from "../types";
 import type { BetterAuthPlugin } from "./plugins";
 import type { SocialProviderList, SocialProviders } from "../social-providers";
-import type { Adapter, SecondaryStorage } from "./adapter";
+import type { AdapterInstance, SecondaryStorage } from "./adapter";
 import type { KyselyDatabaseType } from "../adapters/kysely-adapter/types";
 import type { FieldAttribute } from "../db";
-import type { RateLimit } from "./models";
+import type { Models, RateLimit } from "./models";
 import type { AuthContext } from ".";
 import type { CookieOptions } from "better-call";
 import type { Database } from "better-sqlite3";
+import type { Logger } from "../utils";
+import type { AuthMiddleware } from "../plugins";
+import type { LiteralUnion, OmitId } from "./helper";
+import type { AdapterDebugLogs } from "../adapters";
+//@ts-ignore - we need to import this to get the type of the database
+import type { Database as BunDatabase } from "bun:sqlite";
 
-export interface BetterAuthOptions {
+export type BetterAuthOptions = {
 	/**
 	 * The name of the application
 	 *
@@ -20,18 +32,20 @@ export interface BetterAuthOptions {
 	 */
 	appName?: string;
 	/**
-	 * Base URL for the better auth. This is typically the
-	 * root URL where your application server is hosted. If not explicitly set,
+	 * Base URL for the Better Auth. This is typically the
+	 * root URL where your application server is hosted.
+	 * If not explicitly set,
 	 * the system will check the following environment variable:
 	 *
-	 * process.env.BETTER_AUTH_URL || process.env.AUTH_URL
+	 * process.env.BETTER_AUTH_URL
 	 *
 	 * If not set it will throw an error.
 	 */
 	baseURL?: string;
 	/**
-	 * Base path for the better auth. This is typically the path where the
-	 * better auth routes are mounted.
+	 * Base path for the Better Auth. This is typically
+	 * the path where the
+	 * Better Auth routes are mounted.
 	 *
 	 * @default "/api/auth"
 	 */
@@ -40,7 +54,7 @@ export interface BetterAuthOptions {
 	 * The secret to use for encryption,
 	 * signing and hashing.
 	 *
-	 * By default better auth will look for
+	 * By default Better Auth will look for
 	 * the following environment variables:
 	 * process.env.BETTER_AUTH_SECRET,
 	 * process.env.AUTH_SECRET
@@ -63,24 +77,28 @@ export interface BetterAuthOptions {
 	/**
 	 * Database configuration
 	 */
-	database:
+	database?:
 		| PostgresPool
 		| MysqlPool
 		| Database
 		| Dialect
-		| Adapter
+		| AdapterInstance
+		| BunDatabase
 		| {
 				dialect: Dialect;
 				type: KyselyDatabaseType;
 				/**
-				 * Custom generateId function.
+				 * casing for table names
 				 *
-				 * If not provided, nanoid will be used.
-				 * If set to false, the database's auto generated id will be used.
-				 *
-				 * @default nanoid
+				 * @default "camel"
 				 */
-				generateId?: ((size?: number) => string) | false;
+				casing?: "snake" | "camel";
+				/**
+				 * Enable debug logs for the adapter
+				 *
+				 * @default false
+				 */
+				debugLogs?: AdapterDebugLogs;
 		  }
 		| {
 				/**
@@ -92,14 +110,17 @@ export interface BetterAuthOptions {
 				 */
 				type: KyselyDatabaseType;
 				/**
-				 * Custom generateId function.
+				 * casing for table names
 				 *
-				 * If not provided, nanoid will be used.
-				 * If set to false, the database's auto generated id will be used.
-				 *
-				 * @default nanoid
+				 * @default "camel"
 				 */
-				generateId?: ((size?: number) => string) | false;
+				casing?: "snake" | "camel";
+				/**
+				 * Enable debug logs for the adapter
+				 *
+				 * @default false
+				 */
+				debugLogs?: AdapterDebugLogs;
 		  };
 	/**
 	 * Secondary storage configuration
@@ -120,7 +141,7 @@ export interface BetterAuthOptions {
 			/**
 			 * @param user the user to send the
 			 * verification email to
-			 * @param url the url to send the verification email to
+			 * @param url the URL to send the verification email to
 			 * it contains the token as well
 			 * @param token the token to send the verification email to
 			 */
@@ -141,6 +162,23 @@ export interface BetterAuthOptions {
 		 * @default false
 		 */
 		sendOnSignUp?: boolean;
+		/**
+		 * Auto signin the user after they verify their email
+		 */
+		autoSignInAfterVerification?: boolean;
+
+		/**
+		 * Number of seconds the verification token is
+		 * valid for.
+		 * @default 3600 seconds (1 hour)
+		 */
+		expiresIn?: number;
+		/**
+		 * A function that is called when a user verifies their email
+		 * @param user the user that verified their email
+		 * @param request the request object
+		 */
+		onEmailVerification?: (user: User, request?: Request) => Promise<void>;
 	};
 	/**
 	 * Email and password authentication
@@ -152,6 +190,12 @@ export interface BetterAuthOptions {
 		 * @default false
 		 */
 		enabled: boolean;
+		/**
+		 * Disable email and password sign up
+		 *
+		 * @default false
+		 */
+		disableSignUp?: boolean;
 		/**
 		 * Require email verification before a session
 		 * can be created for the user.
@@ -179,17 +223,20 @@ export interface BetterAuthOptions {
 			/**
 			 * @param user the user to send the
 			 * reset password email to
-			 * @param url the url to send the reset password email to
+			 * @param url the URL to send the reset password email to
+			 * @param token the token to send to the user (could be used instead of sending the url
+			 * if you need to redirect the user to custom route)
 			 */
-			data: { user: User; url: string },
+			data: { user: User; url: string; token: string },
 			/**
 			 * The request object
 			 */
 			request?: Request,
 		) => Promise<void>;
 		/**
-		 * Number of seconds the reset password token is valid for.
-		 * @default 1 hour
+		 * Number of seconds the reset password token is
+		 * valid for.
+		 * @default 1 hour (60 * 60)
 		 */
 		resetPasswordTokenExpiresIn?: number;
 		/**
@@ -202,12 +249,19 @@ export interface BetterAuthOptions {
 		 */
 		password?: {
 			hash?: (password: string) => Promise<string>;
-			verify?: (password: string, hash: string) => Promise<boolean>;
+			verify?: (data: { hash: string; password: string }) => Promise<boolean>;
 		};
 		/**
 		 * Automatically sign in the user after sign up
+		 *
+		 * @default true
 		 */
 		autoSignIn?: boolean;
+		/**
+		 * Whether to revoke all other sessions when resetting password
+		 * @default false
+		 */
+		revokeSessionsOnPasswordReset?: boolean;
 	};
 	/**
 	 * list of social providers
@@ -225,7 +279,17 @@ export interface BetterAuthOptions {
 		 * The model name for the user. Defaults to "user".
 		 */
 		modelName?: string;
-		fields?: Partial<Record<keyof User, string>>;
+		/**
+		 * Map fields
+		 *
+		 * @example
+		 * ```ts
+		 * {
+		 *  userId: "user_id"
+		 * }
+		 * ```
+		 */
+		fields?: Partial<Record<keyof OmitId<User>, string>>;
 		/**
 		 * Additional fields for the session
 		 */
@@ -256,6 +320,48 @@ export interface BetterAuthOptions {
 				request?: Request,
 			) => Promise<void>;
 		};
+		/**
+		 * User deletion configuration
+		 */
+		deleteUser?: {
+			/**
+			 * Enable user deletion
+			 */
+			enabled?: boolean;
+			/**
+			 * Send a verification email when the user deletes their account.
+			 *
+			 * if this is not set, the user will be deleted immediately.
+			 * @param data the data object
+			 * @param request the request object
+			 */
+			sendDeleteAccountVerification?: (
+				data: {
+					user: User;
+					url: string;
+					token: string;
+				},
+				request?: Request,
+			) => Promise<void>;
+			/**
+			 * A function that is called before a user is deleted.
+			 *
+			 * to interrupt with error you can throw `APIError`
+			 */
+			beforeDelete?: (user: User, request?: Request) => Promise<void>;
+			/**
+			 * A function that is called after a user is deleted.
+			 *
+			 * This is useful for cleaning up user data
+			 */
+			afterDelete?: (user: User, request?: Request) => Promise<void>;
+			/**
+			 * The expiration time for the delete token.
+			 *
+			 * @default 1 day (60 * 60 * 24) in seconds
+			 */
+			deleteTokenExpiresIn?: number;
+		};
 	};
 	session?: {
 		/**
@@ -273,7 +379,7 @@ export interface BetterAuthOptions {
 		 *  userId: "user_id"
 		 * }
 		 */
-		fields?: Partial<Record<keyof Session, string>>;
+		fields?: Partial<Record<keyof OmitId<Session>, string>>;
 		/**
 		 * Expiration time for the session token. The value
 		 * should be in seconds.
@@ -287,6 +393,13 @@ export interface BetterAuthOptions {
 		 * @default 1 day (60 * 60 * 24)
 		 */
 		updateAge?: number;
+		/**
+		 * Disable session refresh so that the session is not updated
+		 * regardless of the `updateAge` option.
+		 *
+		 * @default false
+		 */
+		disableSessionRefresh?: boolean;
 		/**
 		 * Additional fields for the session
 		 */
@@ -306,6 +419,16 @@ export interface BetterAuthOptions {
 		 */
 		storeSessionInDatabase?: boolean;
 		/**
+		 * By default, sessions are deleted from the database when secondary storage
+		 * is provided when session is revoked.
+		 *
+		 * Set this to true to preserve session records in the database,
+		 * even if they are deleted from the secondary storage.
+		 *
+		 * @default false
+		 */
+		preserveSessionInDatabase?: boolean;
+		/**
 		 * Enable caching session in cookie
 		 */
 		cookieCache?: {
@@ -320,10 +443,34 @@ export interface BetterAuthOptions {
 			 */
 			enabled?: boolean;
 		};
+		/**
+		 * The age of the session to consider it fresh.
+		 *
+		 * This is used to check if the session is fresh
+		 * for sensitive operations. (e.g. deleting an account)
+		 *
+		 * If the session is not fresh, the user should be prompted
+		 * to sign in again.
+		 *
+		 * If set to 0, the session will be considered fresh every time. (⚠︎ not recommended)
+		 *
+		 * @default 1 day (60 * 60 * 24)
+		 */
+		freshAge?: number;
 	};
 	account?: {
 		modelName?: string;
-		fields?: Partial<Record<keyof Account, string>>;
+		fields?: Partial<Record<keyof OmitId<Account>, string>>;
+		/**
+		 * When enabled (true), the user account data (accessToken, idToken, refreshToken, etc.)
+		 * will be updated on sign in with the latest data from the provider.
+		 *
+		 * @default true
+		 */
+		updateAccountOnSignIn?: boolean;
+		/**
+		 * Configuration for account linking.
+		 */
 		accountLinking?: {
 			/**
 			 * Enable account linking
@@ -334,20 +481,49 @@ export interface BetterAuthOptions {
 			/**
 			 * List of trusted providers
 			 */
-			trustedProviders?: Array<SocialProviderList[number] | "email-password">;
+			trustedProviders?: Array<
+				LiteralUnion<SocialProviderList[number] | "email-password", string>
+			>;
+			/**
+			 * If enabled (true), this will allow users to manually linking accounts with different email addresses than the main user.
+			 *
+			 * @default false
+			 *
+			 * ⚠️ Warning: enabling this might lead to account takeovers, so proceed with caution.
+			 */
+			allowDifferentEmails?: boolean;
+			/**
+			 * If enabled (true), this will allow users to unlink all accounts.
+			 *
+			 * @default false
+			 */
+			allowUnlinkingAll?: boolean;
 		};
 	};
 	/**
 	 * Verification configuration
 	 */
 	verification?: {
+		/**
+		 * Change the modelName of the verification table
+		 */
 		modelName?: string;
-		fields?: Partial<Record<keyof Verification, string>>;
+		/**
+		 * Map verification fields
+		 */
+		fields?: Partial<Record<keyof OmitId<Verification>, string>>;
+		/**
+		 * disable cleaning up expired values when a verification value is
+		 * fetched
+		 */
+		disableCleanup?: boolean;
 	};
 	/**
 	 * List of trusted origins.
 	 */
-	trustedOrigins?: string[];
+	trustedOrigins?:
+		| string[]
+		| ((request: Request) => string[] | Promise<string[]>);
 	/**
 	 * Rate limiting configuration
 	 */
@@ -375,16 +551,23 @@ export interface BetterAuthOptions {
 		 * specific paths.
 		 */
 		customRules?: {
-			[key: string]: {
-				/**
-				 * The window to use for the custom rule.
-				 */
-				window: number;
-				/**
-				 * The maximum number of requests allowed within the window.
-				 */
-				max: number;
-			};
+			[key: string]:
+				| {
+						/**
+						 * The window to use for the custom rule.
+						 */
+						window: number;
+						/**
+						 * The maximum number of requests allowed within the window.
+						 */
+						max: number;
+				  }
+				| ((request: Request) =>
+						| { window: number; max: number }
+						| Promise<{
+								window: number;
+								max: number;
+						  }>);
 		};
 		/**
 		 * Storage configuration
@@ -402,7 +585,7 @@ export interface BetterAuthOptions {
 		 *
 		 * @default "rateLimit"
 		 */
-		tableName?: string;
+		modelName?: string;
 		/**
 		 * Custom field names for the rate limit table
 		 */
@@ -503,53 +686,148 @@ export interface BetterAuthOptions {
 		 * ```
 		 */
 		cookiePrefix?: string;
-	};
-	logger?: {
 		/**
-		 * Disable logging
+		 * Database configuration.
+		 */
+		database?: {
+			/**
+			 * The default number of records to return from the database
+			 * when using the `findMany` adapter method.
+			 *
+			 * @default 100
+			 */
+			defaultFindManyLimit?: number;
+			/**
+			 * If your database auto increments number ids, set this to `true`.
+			 *
+			 * Note: If enabled, we will not handle ID generation (including if you use `generateId`), and it would be expected that your database will provide the ID automatically.
+			 *
+			 * @default false
+			 */
+			useNumberId?: boolean;
+			/**
+			 * Custom generateId function.
+			 *
+			 * If not provided, random ids will be generated.
+			 * If set to false, the database's auto generated id will be used.
+			 */
+			generateId?:
+				| ((options: {
+						model: LiteralUnion<Models, string>;
+						size?: number;
+				  }) => string)
+				| false;
+		};
+		/**
+		 * Custom generateId function.
 		 *
-		 * @default false
+		 * If not provided, random ids will be generated.
+		 * If set to false, the database's auto generated id will be used.
+		 *
+		 * @deprecated Please use `database.generateId` instead. This will be potentially removed in future releases.
 		 */
-		disabled?: boolean;
-		/**
-		 * log verbose information
-		 */
-		verboseLogging?: boolean;
+		generateId?:
+			| ((options: {
+					model: LiteralUnion<Models, string>;
+					size?: number;
+			  }) => string)
+			| false;
 	};
+	logger?: Logger;
 	/**
 	 * allows you to define custom hooks that can be
 	 * executed during lifecycle of core database
 	 * operations.
 	 */
 	databaseHooks?: {
+		/**
+		 * User hooks
+		 */
 		user?: {
-			[key in "create" | "update"]?: {
+			create?: {
 				/**
 				 * Hook that is called before a user is created.
 				 * if the hook returns false, the user will not be created.
 				 * If the hook returns an object, it'll be used instead of the original data
 				 */
-				before?: (user: User) => Promise<
+				before?: (
+					user: User,
+					context?: GenericEndpointContext,
+				) => Promise<
 					| boolean
 					| void
 					| {
-							data: User & Record<string, any>;
+							data: Partial<User> & Record<string, any>;
 					  }
 				>;
 				/**
 				 * Hook that is called after a user is created.
 				 */
-				after?: (user: User) => Promise<void>;
+				after?: (user: User, context?: GenericEndpointContext) => Promise<void>;
 			};
-		};
-		session?: {
-			[key in "create" | "update"]?: {
+			update?: {
 				/**
-				 * Hook that is called before a user is created.
-				 * if the hook returns false, the user will not be created.
+				 * Hook that is called before a user is updated.
+				 * if the hook returns false, the user will not be updated.
 				 * If the hook returns an object, it'll be used instead of the original data
 				 */
-				before?: (session: Session) => Promise<
+				before?: (
+					user: Partial<User>,
+					context?: GenericEndpointContext,
+				) => Promise<
+					| boolean
+					| void
+					| {
+							data: Partial<User & Record<string, any>>;
+					  }
+				>;
+				/**
+				 * Hook that is called after a user is updated.
+				 */
+				after?: (user: User, context?: GenericEndpointContext) => Promise<void>;
+			};
+		};
+		/**
+		 * Session Hook
+		 */
+		session?: {
+			create?: {
+				/**
+				 * Hook that is called before a session is created.
+				 * if the hook returns false, the session will not be created.
+				 * If the hook returns an object, it'll be used instead of the original data
+				 */
+				before?: (
+					session: Session,
+					context?: GenericEndpointContext,
+				) => Promise<
+					| boolean
+					| void
+					| {
+							data: Partial<Session> & Record<string, any>;
+					  }
+				>;
+				/**
+				 * Hook that is called after a session is created.
+				 */
+				after?: (
+					session: Session,
+					context?: GenericEndpointContext,
+				) => Promise<void>;
+			};
+			/**
+			 * Update hook
+			 */
+			update?: {
+				/**
+				 * Hook that is called before a user is updated.
+				 * if the hook returns false, the session will not be updated.
+				 * If the hook returns an object, it'll be used instead of the original data
+				 */
+				before?: (
+					session: Partial<Session>,
+					context?: GenericEndpointContext,
+				) => Promise<
 					| boolean
 					| void
 					| {
@@ -557,49 +835,121 @@ export interface BetterAuthOptions {
 					  }
 				>;
 				/**
-				 * Hook that is called after a user is created.
+				 * Hook that is called after a session is updated.
 				 */
-				after?: (session: Session) => Promise<void>;
+				after?: (
+					session: Session,
+					context?: GenericEndpointContext,
+				) => Promise<void>;
 			};
 		};
+		/**
+		 * Account Hook
+		 */
 		account?: {
-			[key in "create" | "update"]?: {
+			create?: {
 				/**
-				 * Hook that is called before a user is created.
-				 * If the hook returns false, the user will not be created.
+				 * Hook that is called before a account is created.
+				 * If the hook returns false, the account will not be created.
 				 * If the hook returns an object, it'll be used instead of the original data
 				 */
-				before?: (account: Account) => Promise<
+				before?: (
+					account: Account,
+					context?: GenericEndpointContext,
+				) => Promise<
 					| boolean
 					| void
 					| {
-							data: Account & Record<string, any>;
+							data: Partial<Account> & Record<string, any>;
 					  }
 				>;
 				/**
-				 * Hook that is called after a user is created.
+				 * Hook that is called after a account is created.
 				 */
-				after?: (account: Account) => Promise<void>;
+				after?: (
+					account: Account,
+					context?: GenericEndpointContext,
+				) => Promise<void>;
+			};
+			/**
+			 * Update hook
+			 */
+			update?: {
+				/**
+				 * Hook that is called before a account is update.
+				 * If the hook returns false, the user will not be updated.
+				 * If the hook returns an object, it'll be used instead of the original data
+				 */
+				before?: (
+					account: Partial<Account>,
+					context?: GenericEndpointContext,
+				) => Promise<
+					| boolean
+					| void
+					| {
+							data: Partial<Account & Record<string, any>>;
+					  }
+				>;
+				/**
+				 * Hook that is called after a account is updated.
+				 */
+				after?: (
+					account: Account,
+					context?: GenericEndpointContext,
+				) => Promise<void>;
 			};
 		};
+		/**
+		 * Verification Hook
+		 */
 		verification?: {
-			[key in "create" | "update"]: {
+			create?: {
 				/**
-				 * Hook that is called before a user is created.
-				 * if the hook returns false, the user will not be created.
+				 * Hook that is called before a verification is created.
+				 * if the hook returns false, the verification will not be created.
 				 * If the hook returns an object, it'll be used instead of the original data
 				 */
-				before?: (verification: Verification) => Promise<
+				before?: (
+					verification: Verification,
+					context?: GenericEndpointContext,
+				) => Promise<
 					| boolean
 					| void
 					| {
-							data: Verification & Record<string, any>;
+							data: Partial<Verification> & Record<string, any>;
 					  }
 				>;
 				/**
-				 * Hook that is called after a user is created.
+				 * Hook that is called after a verification is created.
 				 */
-				after?: (verification: Verification) => Promise<void>;
+				after?: (
+					verification: Verification,
+					context?: GenericEndpointContext,
+				) => Promise<void>;
+			};
+			update?: {
+				/**
+				 * Hook that is called before a verification is updated.
+				 * if the hook returns false, the verification will not be updated.
+				 * If the hook returns an object, it'll be used instead of the original data
+				 */
+				before?: (
+					verification: Partial<Verification>,
+					context?: GenericEndpointContext,
+				) => Promise<
+					| boolean
+					| void
+					| {
+							data: Partial<Verification & Record<string, any>>;
+					  }
+				>;
+				/**
+				 * Hook that is called after a verification is updated.
+				 */
+				after?: (
+					verification: Verification,
+					context?: GenericEndpointContext,
+				) => Promise<void>;
 			};
 		};
 	};
@@ -620,5 +970,33 @@ export interface BetterAuthOptions {
 		 * @param ctx - Auth context
 		 */
 		onError?: (error: unknown, ctx: AuthContext) => void | Promise<void>;
+		/**
+		 * The URL to redirect to on error
+		 *
+		 * When errorURL is provided, the error will be added to the URL as a query parameter
+		 * and the user will be redirected to the errorURL.
+		 *
+		 * @default - "/api/auth/error"
+		 */
+		errorURL?: string;
 	};
-}
+	/**
+	 * Hooks
+	 */
+	hooks?: {
+		/**
+		 * Before a request is processed
+		 */
+		before?: AuthMiddleware;
+		/**
+		 * After a request is processed
+		 */
+		after?: AuthMiddleware;
+	};
+	/**
+	 * Disabled paths
+	 *
+	 * Paths you want to disable.
+	 */
+	disabledPaths?: string[];
+};

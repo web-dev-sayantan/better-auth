@@ -1,12 +1,7 @@
-import {
-	generateCodeVerifier,
-	generateState as generateSateCode,
-} from "oslo/oauth2";
 import { z } from "zod";
 import type { GenericEndpointContext } from "../types";
 import { APIError } from "better-call";
-import { logger } from "../utils";
-import { getOrigin } from "../utils/url";
+import { generateRandomString } from "../crypto";
 
 export async function generateState(
 	c: GenericEndpointContext,
@@ -15,36 +10,39 @@ export async function generateState(
 		userId: string;
 	},
 ) {
-	const callbackURL =
-		c.body?.callbackURL ||
-		(c.query?.currentURL ? getOrigin(c.query?.currentURL) : "") ||
-		c.context.options.baseURL;
+	const callbackURL = c.body?.callbackURL || c.context.options.baseURL;
 	if (!callbackURL) {
 		throw new APIError("BAD_REQUEST", {
 			message: "callbackURL is required",
 		});
 	}
-	const codeVerifier = generateCodeVerifier();
-	const state = generateSateCode();
+	const codeVerifier = generateRandomString(128);
+	const state = generateRandomString(32);
 	const data = JSON.stringify({
 		callbackURL,
 		codeVerifier,
-		errorURL: c.query?.currentURL,
+		errorURL: c.body?.errorCallbackURL,
+		newUserURL: c.body?.newUserCallbackURL,
 		link,
+
 		/**
 		 * This is the actual expiry time of the state
 		 */
 		expiresAt: Date.now() + 10 * 60 * 1000,
+		requestSignUp: c.body?.requestSignUp,
 	});
 	const expiresAt = new Date();
 	expiresAt.setMinutes(expiresAt.getMinutes() + 10);
-	const verification = await c.context.internalAdapter.createVerificationValue({
-		value: data,
-		identifier: state,
-		expiresAt,
-	});
+	const verification = await c.context.internalAdapter.createVerificationValue(
+		{
+			value: data,
+			identifier: state,
+			expiresAt,
+		},
+		c,
+	);
 	if (!verification) {
-		logger.error(
+		c.context.logger.error(
 			"Unable to create verification. Make sure the database adapter is properly working and there is a verification table in the database",
 		);
 		throw new APIError("INTERNAL_SERVER_ERROR", {
@@ -58,10 +56,10 @@ export async function generateState(
 }
 
 export async function parseState(c: GenericEndpointContext) {
-	const state = c.query.state;
+	const state = c.query.state || c.body.state;
 	const data = await c.context.internalAdapter.findVerificationValue(state);
 	if (!data) {
-		logger.error("State Mismatch. Verification not found", {
+		c.context.logger.error("State Mismatch. Verification not found", {
 			state,
 		});
 		throw c.redirect(
@@ -73,13 +71,15 @@ export async function parseState(c: GenericEndpointContext) {
 			callbackURL: z.string(),
 			codeVerifier: z.string(),
 			errorURL: z.string().optional(),
+			newUserURL: z.string().optional(),
 			expiresAt: z.number(),
 			link: z
 				.object({
 					email: z.string(),
-					userId: z.string(),
+					userId: z.coerce.string(),
 				})
 				.optional(),
+			requestSignUp: z.boolean().optional(),
 		})
 		.parse(JSON.parse(data.value));
 
@@ -88,22 +88,10 @@ export async function parseState(c: GenericEndpointContext) {
 	}
 	if (parsedData.expiresAt < Date.now()) {
 		await c.context.internalAdapter.deleteVerificationValue(data.id);
-		logger.error("State expired.", {
-			state,
-		});
 		throw c.redirect(
 			`${c.context.baseURL}/error?error=please_restart_the_process`,
 		);
 	}
-
 	await c.context.internalAdapter.deleteVerificationValue(data.id);
-	return parsedData as {
-		callbackURL: string;
-		codeVerifier: string;
-		link?: {
-			email: string;
-			userId: string;
-		};
-		errorURL: string;
-	};
+	return parsedData;
 }

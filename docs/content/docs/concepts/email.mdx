@@ -40,7 +40,7 @@ export const auth = betterAuth({
 
 ### Triggering Email Verification
 
-You can initiate email verification in two ways:
+You can initiate email verification in several ways:
 
 #### 1. During Sign-up
 
@@ -80,8 +80,8 @@ export const auth = betterAuth({
 
 if a user tries to sign in without verifying their email, you can handle the error and show a message to the user.
 
-```ts title="client.ts"
-await authClient.signIn.emailAndPassword({
+```ts title="auth-client.ts"
+await authClient.signIn.email({
     email: "email@example.com",
     password: "password"
 }, {
@@ -114,14 +114,25 @@ If the user clicks the provided verification URL, their email is automatically v
 For manual verification, you can send the user a custom link with the `token` and call the `verifyEmail` function.
 
 ```ts
-authClient.verifyEmail({
+await authClient.verifyEmail({
     query: {
         token: "" // Pass the token here
     }
 })
 ```
 
+### Auto SignIn After Verification
 
+To sign in the user automatically after they successfully verify their email, set the `autoSignInAfterVerification` option to `true`:
+
+```ts
+const auth = betterAuth({
+    //...your other options
+    emailVerification: {
+        autoSignInAfterVerification: true
+    }
+})
+```
 
 ## Password Reset Email
 

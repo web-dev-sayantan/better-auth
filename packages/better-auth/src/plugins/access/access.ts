@@ -1,97 +1,88 @@
-import type { StatementsPrimitive as Statements, Subset } from "./types";
+import { BetterAuthError } from "../../error";
+import type { Statements, Subset } from "./types";
 
-export class ParsingError extends Error {
-	public readonly path: string;
-	constructor(message: string, path: string) {
-		super(message);
-		this.path = path;
-	}
-}
-
-type Connector = "OR" | "AND";
-
-export class AccessControl<TStatements extends Statements = Statements> {
-	private readonly statements: TStatements;
-	constructor(private readonly s: TStatements) {
-		this.statements = s;
-	}
-	public newRole<K extends keyof TStatements>(
-		statements: Subset<K, TStatements>,
-	) {
-		return new Role<Subset<K, TStatements>>(statements);
-	}
-}
-
-export type AuthortizeResponse =
+export type AuthorizeResponse =
 	| { success: false; error: string }
 	| { success: true; error?: never };
 
-export class Role<TStatements extends Statements> {
-	public readonly statements: TStatements;
-
-	constructor(statements: TStatements) {
-		this.statements = statements;
-	}
-
-	public authorize<K extends keyof TStatements>(
-		request: Subset<K, TStatements>,
-		connector?: Connector,
-	): AuthortizeResponse {
-		for (const [requestedResource, requestedActions] of Object.entries(
-			request,
-		)) {
-			const allowedActions = this.statements[requestedResource];
-			if (!allowedActions) {
-				return {
-					success: false,
-					error: `You are not allowed to access resource: ${requestedResource}`,
-				};
+export function role<TStatements extends Statements>(statements: TStatements) {
+	return {
+		authorize<K extends keyof TStatements>(
+			request: {
+				[key in K]?:
+					| TStatements[key]
+					| {
+							actions: TStatements[key];
+							connector: "OR" | "AND";
+					  };
+			},
+			connector: "OR" | "AND" = "AND",
+		): AuthorizeResponse {
+			let success = false;
+			for (const [requestedResource, requestedActions] of Object.entries(
+				request,
+			)) {
+				const allowedActions = statements[requestedResource];
+				if (!allowedActions) {
+					return {
+						success: false,
+						error: `You are not allowed to access resource: ${requestedResource}`,
+					};
+				}
+				if (Array.isArray(requestedActions)) {
+					success = (requestedActions as string[]).every((requestedAction) =>
+						allowedActions.includes(requestedAction),
+					);
+				} else {
+					if (typeof requestedActions === "object") {
+						const actions = requestedActions as {
+							actions: string[];
+							connector: "OR" | "AND";
+						};
+						if (actions.connector === "OR") {
+							success = actions.actions.some((requestedAction) =>
+								allowedActions.includes(requestedAction),
+							);
+						} else {
+							success = actions.actions.every((requestedAction) =>
+								allowedActions.includes(requestedAction),
+							);
+						}
+					} else {
+						throw new BetterAuthError("Invalid access control request");
+					}
+				}
+				if (success && connector === "OR") {
+					return { success };
+				}
+				if (!success && connector === "AND") {
+					return {
+						success: false,
+						error: `unauthorized to access resource "${requestedResource}"`,
+					};
+				}
 			}
-			const success =
-				connector === "OR"
-					? (requestedActions as string[]).some((requestedAction) =>
-							allowedActions.includes(requestedAction),
-						)
-					: (requestedActions as string[]).every((requestedAction) =>
-							allowedActions.includes(requestedAction),
-						);
 			if (success) {
-				return { success };
+				return {
+					success,
+				};
 			}
 			return {
 				success: false,
-				error: `unauthorized to access resource "${requestedResource}"`,
+				error: "Not authorized",
 			};
-		}
-		return {
-			success: false,
-			error: "Not authorized",
-		};
-	}
+		},
+		statements,
+	};
+}
 
-	static fromString<TStatements extends Statements>(s: string) {
-		const statements = JSON.parse(s) as TStatements;
-
-		if (typeof statements !== "object") {
-			throw new ParsingError("statements is not an object", ".");
-		}
-		for (const [resource, actions] of Object.entries(statements)) {
-			if (typeof resource !== "string") {
-				throw new ParsingError("invalid resource identifier", resource);
-			}
-			if (!Array.isArray(actions)) {
-				throw new ParsingError("actions is not an array", resource);
-			}
-			for (let i = 0; i < actions.length; i++) {
-				if (typeof actions[i] !== "string") {
-					throw new ParsingError("action is not a string", `${resource}[${i}]`);
-				}
-			}
-		}
-		return new Role<TStatements>(statements);
-	}
-
-	public toString(): string {
-		return JSON.stringify(this.statements);
-	}
+export function createAccessControl<const TStatements extends Statements>(
+	s: TStatements,
+) {
+	return {
+		newRole<K extends keyof TStatements>(statements: Subset<K, TStatements>) {
+			return role<Subset<K, TStatements>>(statements);
+		},
+		statements: s,
+	};
 }

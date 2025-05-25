@@ -1,9 +1,10 @@
-import { parseJWT } from "oslo/jwt";
-import type { OAuthProvider, ProviderOptions } from "../oauth2";
-import { BetterAuthError } from "../error";
-import { logger } from "../utils/logger";
-import { createAuthorizationURL, validateAuthorizationCode } from "../oauth2";
 import { betterFetch } from "@better-fetch/fetch";
+import { decodeJwt } from "jose";
+import { BetterAuthError } from "../error";
+import type { OAuthProvider, ProviderOptions } from "../oauth2";
+import { createAuthorizationURL, validateAuthorizationCode } from "../oauth2";
+import { logger } from "../utils/logger";
+import { refreshAccessToken } from "../oauth2/refresh-access-token";
 
 export interface GoogleProfile {
 	aud: string;
@@ -32,16 +33,33 @@ export interface GoogleProfile {
 	sub: string;
 }
 
-export interface GoogleOptions extends ProviderOptions {
+export interface GoogleOptions extends ProviderOptions<GoogleProfile> {
+	/**
+	 * The access type to use for the authorization code request
+	 */
 	accessType?: "offline" | "online";
-	prompt?: "none" | "consent" | "select_account";
+	/**
+	 * The display mode to use for the authorization code request
+	 */
+	display?: "page" | "popup" | "touch" | "wap";
+	/**
+	 * The hosted domain of the user
+	 */
+	hd?: string;
 }
 
 export const google = (options: GoogleOptions) => {
 	return {
 		id: "google",
 		name: "Google",
-		async createAuthorizationURL({ state, scopes, codeVerifier, redirectURI }) {
+		async createAuthorizationURL({
+			state,
+			scopes,
+			codeVerifier,
+			redirectURI,
+			loginHint,
+			display,
+		}) {
 			if (!options.clientId || !options.clientSecret) {
 				logger.error(
 					"Client Id and Client Secret is required for Google. Make sure to provide them in the options.",
@@ -51,9 +69,11 @@ export const google = (options: GoogleOptions) => {
 			if (!codeVerifier) {
 				throw new BetterAuthError("codeVerifier is required for Google");
 			}
-			const _scopes = scopes || ["email", "profile", "openid"];
+			const _scopes = options.disableDefaultScope
+				? []
+				: ["email", "profile", "openid"];
 			options.scope && _scopes.push(...options.scope);
-
+			scopes && _scopes.push(...scopes);
 			const url = await createAuthorizationURL({
 				id: "google",
 				options,
@@ -62,21 +82,36 @@ export const google = (options: GoogleOptions) => {
 				state,
 				codeVerifier,
 				redirectURI,
+				prompt: options.prompt,
+				accessType: options.accessType,
+				display: display || options.display,
+				loginHint,
+				hd: options.hd,
 			});
-			options.accessType &&
-				url.searchParams.set("access_type", options.accessType);
-			options.prompt && url.searchParams.set("prompt", options.prompt);
 			return url;
 		},
 		validateAuthorizationCode: async ({ code, codeVerifier, redirectURI }) => {
 			return validateAuthorizationCode({
 				code,
 				codeVerifier,
-				redirectURI: options.redirectURI || redirectURI,
+				redirectURI,
 				options,
 				tokenEndpoint: "https://oauth2.googleapis.com/token",
 			});
 		},
+		refreshAccessToken: options.refreshAccessToken
+			? options.refreshAccessToken
+			: async (refreshToken) => {
+					return refreshAccessToken({
+						refreshToken,
+						options: {
+							clientId: options.clientId,
+							clientKey: options.clientKey,
+							clientSecret: options.clientSecret,
+						},
+						tokenEndpoint: "https://www.googleapis.com/oauth2/v4/token",
+					});
+				},
 		async verifyIdToken(token, nonce) {
 			if (options.disableIdTokenSignIn) {
 				return false;
@@ -99,14 +134,19 @@ export const google = (options: GoogleOptions) => {
 			}
 			const isValid =
 				tokenInfo.aud === options.clientId &&
-				tokenInfo.iss === "https://accounts.google.com";
+				(tokenInfo.iss === "https://accounts.google.com" ||
+					tokenInfo.iss === "accounts.google.com");
 			return isValid;
 		},
 		async getUserInfo(token) {
+			if (options.getUserInfo) {
+				return options.getUserInfo(token);
+			}
 			if (!token.idToken) {
 				return null;
 			}
-			const user = parseJWT(token.idToken)?.payload as GoogleProfile;
+			const user = decodeJwt(token.idToken) as GoogleProfile;
+			const userMap = await options.mapProfileToUser?.(user);
 			return {
 				user: {
 					id: user.sub,
@@ -114,9 +154,11 @@ export const google = (options: GoogleOptions) => {
 					email: user.email,
 					image: user.picture,
 					emailVerified: user.email_verified,
+					...userMap,
 				},
 				data: user,
 			};
 		},
+		options,
 	} satisfies OAuthProvider<GoogleProfile>;
 };

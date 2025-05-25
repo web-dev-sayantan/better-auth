@@ -1,19 +1,21 @@
 import fs from "fs/promises";
-import { alphabet, generateRandomString } from "../crypto/random";
+import { generateRandomString } from "../crypto/random";
 import { afterAll } from "vitest";
 import { betterAuth } from "../auth";
 import { createAuthClient } from "../client/vanilla";
-import type { BetterAuthOptions, ClientOptions, User } from "../types";
+import type { BetterAuthOptions, ClientOptions, Session, User } from "../types";
 import { getMigrations } from "../db/get-migration";
-import { parseSetCookieHeader } from "../cookies";
+import { parseSetCookieHeader, setCookieToHeader } from "../cookies";
 import type { SuccessContext } from "@better-fetch/fetch";
 import { getAdapter } from "../db/utils";
 import Database from "better-sqlite3";
 import { getBaseURL } from "../utils/url";
-import { Kysely, PostgresDialect, sql } from "kysely";
+import { Kysely, MysqlDialect, PostgresDialect, sql } from "kysely";
 import { Pool } from "pg";
 import { MongoClient } from "mongodb";
-import { mongodbAdapter } from "../adapters";
+import { mongodbAdapter } from "../adapters/mongodb-adapter";
+import { createPool } from "mysql2/promise";
+import { bearer } from "../plugins";
 
 export async function getTestInstance<
 	O extends Partial<BetterAuthOptions>,
@@ -25,14 +27,15 @@ export async function getTestInstance<
 		port?: number;
 		disableTestUser?: boolean;
 		testUser?: Partial<User>;
+		testWith?: "sqlite" | "postgres" | "mongodb" | "mysql";
 	},
-	testWith?: "sqlite" | "postgres" | "mongodb",
 ) {
+	const testWith = config?.testWith || "sqlite";
 	/**
 	 * create db folder if not exists
 	 */
 	await fs.mkdir(".db", { recursive: true });
-	const randomStr = generateRandomString(4, alphabet("a-z"));
+	const randomStr = generateRandomString(4, "a-z");
 	const dbName = `./.db/test-${randomStr}.db`;
 
 	const postgres = new Kysely({
@@ -41,6 +44,12 @@ export async function getTestInstance<
 				connectionString: "postgres://user:password@localhost:5432/better_auth",
 			}),
 		}),
+	});
+
+	const mysql = new Kysely({
+		dialect: new MysqlDialect(
+			createPool("mysql://user:password@localhost:3306/better_auth"),
+		),
 	});
 
 	async function mongodbClient() {
@@ -71,7 +80,9 @@ export async function getTestInstance<
 				? { db: postgres, type: "postgres" }
 				: testWith === "mongodb"
 					? mongodbAdapter(await mongodbClient())
-					: new Database(dbName),
+					: testWith === "mysql"
+						? { db: mysql, type: "mysql" }
+						: new Database(dbName),
 		emailAndPassword: {
 			enabled: true,
 		},
@@ -91,12 +102,13 @@ export async function getTestInstance<
 			disableCSRFCheck: true,
 			...options?.advanced,
 		},
+		plugins: [bearer(), ...(options?.plugins || [])],
 	} as O extends undefined ? typeof opts : O & typeof opts);
 
 	const testUser = {
 		email: "test@test.com",
 		password: "test123456",
-		name: "test",
+		name: "test user",
 		...config?.testUser,
 	};
 	async function createTestUser() {
@@ -104,7 +116,7 @@ export async function getTestInstance<
 			return;
 		}
 		//@ts-expect-error
-		await auth.api.signUpEmail({
+		const res = await auth.api.signUpEmail({
 			body: testUser,
 		});
 	}
@@ -116,6 +128,7 @@ export async function getTestInstance<
 		});
 		await runMigrations();
 	}
+
 	await createTestUser();
 
 	afterAll(async () => {
@@ -129,9 +142,21 @@ export async function getTestInstance<
 				postgres,
 			);
 			await postgres.destroy();
-		} else {
-			await fs.unlink(dbName);
+			return;
 		}
+
+		if (testWith === "mysql") {
+			await sql`SET FOREIGN_KEY_CHECKS = 0;`.execute(mysql);
+			const tables = await mysql.introspection.getTables();
+			for (const table of tables) {
+				// @ts-expect-error
+				await mysql.deleteFrom(table.name).execute();
+			}
+			await sql`SET FOREIGN_KEY_CHECKS = 1;`.execute(mysql);
+			return;
+		}
+
+		await fs.unlink(dbName);
 	});
 
 	async function signInWithTestUser() {
@@ -144,10 +169,9 @@ export async function getTestInstance<
 			headers.set("cookie", `${current || ""}; ${name}=${value}`);
 		};
 		//@ts-expect-error
-		const res = await client.signIn.email({
+		const { data, error } = await client.signIn.email({
 			email: testUser.email,
 			password: testUser.password,
-
 			fetchOptions: {
 				//@ts-expect-error
 				onSuccess(context) {
@@ -159,7 +183,8 @@ export async function getTestInstance<
 			},
 		});
 		return {
-			res,
+			session: data.session as Session,
+			user: data.user as User,
 			headers,
 			setCookie,
 		};
@@ -167,7 +192,7 @@ export async function getTestInstance<
 	async function signInWithUser(email: string, password: string) {
 		let headers = new Headers();
 		//@ts-expect-error
-		const res = await client.signIn.email({
+		const { data } = await client.signIn.email({
 			email,
 			password,
 			fetchOptions: {
@@ -181,7 +206,10 @@ export async function getTestInstance<
 			},
 		});
 		return {
-			res,
+			res: data as {
+				user: User;
+				session: Session;
+			},
 			headers,
 		};
 	}
@@ -190,8 +218,7 @@ export async function getTestInstance<
 		url: string | URL | Request,
 		init?: RequestInit,
 	) => {
-		const req = new Request(url.toString(), init);
-		return auth.handler(req);
+		return auth.handler(new Request(url, init));
 	};
 
 	function sessionSetter(headers: Headers) {
@@ -221,6 +248,7 @@ export async function getTestInstance<
 		testUser,
 		signInWithTestUser,
 		signInWithUser,
+		cookieSetter: setCookieToHeader,
 		customFetchImpl,
 		sessionSetter,
 		db: await getAdapter(auth.options),

@@ -3,7 +3,9 @@ import { createAuthEndpoint } from "../../api/call";
 import type { BetterAuthPlugin } from "../../types/plugins";
 import { APIError } from "better-call";
 import { setSessionCookie } from "../../cookies";
-import { alphabet, generateRandomString } from "../../crypto";
+import { generateRandomString } from "../../crypto";
+import { BASE_ERROR_CODES } from "../../error/codes";
+import { originCheck } from "../../api";
 
 interface MagicLinkOptions {
 	/**
@@ -40,6 +42,10 @@ interface MagicLinkOptions {
 		window: number;
 		max: number;
 	};
+	/**
+	 * Custom function to generate a token
+	 */
+	generateToken?: (email: string) => Promise<string> | string;
 }
 
 export const magicLink = (options: MagicLinkOptions) => {
@@ -52,9 +58,45 @@ export const magicLink = (options: MagicLinkOptions) => {
 					method: "POST",
 					requireHeaders: true,
 					body: z.object({
-						email: z.string().email(),
-						callbackURL: z.string().optional(),
+						email: z
+							.string({
+								description: "Email address to send the magic link",
+							})
+							.email(),
+						name: z
+							.string({
+								description:
+									"User display name. Only used if the user is registering for the first time.",
+							})
+							.optional(),
+						callbackURL: z
+							.string({
+								description: "URL to redirect after magic link verification",
+							})
+							.optional(),
 					}),
+					metadata: {
+						openapi: {
+							description: "Sign in with magic link",
+							responses: {
+								200: {
+									description: "Success",
+									content: {
+										"application/json": {
+											schema: {
+												type: "object",
+												properties: {
+													status: {
+														type: "boolean",
+													},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
 				},
 				async (ctx) => {
 					const { email } = ctx.body;
@@ -65,42 +107,37 @@ export const magicLink = (options: MagicLinkOptions) => {
 
 						if (!user) {
 							throw new APIError("BAD_REQUEST", {
-								message: "User not found",
+								message: BASE_ERROR_CODES.USER_NOT_FOUND,
 							});
 						}
 					}
 
-					const verificationToken = generateRandomString(
-						32,
-						alphabet("a-z", "A-Z"),
+					const verificationToken = options?.generateToken
+						? await options.generateToken(email)
+						: generateRandomString(32, "a-z", "A-Z");
+					await ctx.context.internalAdapter.createVerificationValue(
+						{
+							identifier: verificationToken,
+							value: JSON.stringify({ email, name: ctx.body.name }),
+							expiresAt: new Date(
+								Date.now() + (options.expiresIn || 60 * 5) * 1000,
+							),
+						},
+						ctx,
 					);
-					await ctx.context.internalAdapter.createVerificationValue({
-						identifier: verificationToken,
-						value: email,
-						expiresAt: new Date(
-							Date.now() + (options.expiresIn || 60 * 5) * 1000,
-						),
-					});
 					const url = `${
 						ctx.context.baseURL
-					}/magic-link/verify?token=${verificationToken}&callbackURL=${
-						ctx.body.callbackURL || "/"
-					}`;
-					try {
-						await options.sendMagicLink(
-							{
-								email,
-								url,
-								token: verificationToken,
-							},
-							ctx.request,
-						);
-					} catch (e) {
-						ctx.context.logger.error("Failed to send magic link", e);
-						throw new APIError("INTERNAL_SERVER_ERROR", {
-							message: "Failed to send magic link",
-						});
-					}
+					}/magic-link/verify?token=${verificationToken}&callbackURL=${encodeURIComponent(
+						ctx.body.callbackURL || "/",
+					)}`;
+					await options.sendMagicLink(
+						{
+							email,
+							url,
+							token: verificationToken,
+						},
+						ctx.request,
+					);
 					return ctx.json({
 						status: true,
 					});
@@ -111,13 +148,55 @@ export const magicLink = (options: MagicLinkOptions) => {
 				{
 					method: "GET",
 					query: z.object({
-						token: z.string(),
-						callbackURL: z.string().optional(),
+						token: z.string({
+							description: "Verification token",
+						}),
+						callbackURL: z
+							.string({
+								description:
+									"URL to redirect after magic link verification, if not provided will return session",
+							})
+							.optional(),
 					}),
+					use: [
+						originCheck((ctx) => {
+							return ctx.query.callbackURL
+								? decodeURIComponent(ctx.query.callbackURL)
+								: "/";
+						}),
+					],
 					requireHeaders: true,
+					metadata: {
+						openapi: {
+							description: "Verify magic link",
+							responses: {
+								200: {
+									description: "Success",
+									content: {
+										"application/json": {
+											schema: {
+												type: "object",
+												properties: {
+													session: {
+														$ref: "#/components/schemas/Session",
+													},
+													user: {
+														$ref: "#/components/schemas/User",
+													},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
 				},
 				async (ctx) => {
-					const { token, callbackURL } = ctx.query;
+					const token = ctx.query.token;
+					const callbackURL = ctx.query.callbackURL
+						? decodeURIComponent(ctx.query.callbackURL)
+						: "/";
 					const toRedirectTo = callbackURL?.startsWith("http")
 						? callbackURL
 						: callbackURL
@@ -137,39 +216,74 @@ export const magicLink = (options: MagicLinkOptions) => {
 					await ctx.context.internalAdapter.deleteVerificationValue(
 						tokenValue.id,
 					);
-					const email = tokenValue.value;
-					const user = await ctx.context.internalAdapter.findUserByEmail(email);
-					let userId: string = user?.user.id || "";
+					const { email, name } = JSON.parse(tokenValue.value) as {
+						email: string;
+						name?: string;
+					};
+					let user = await ctx.context.internalAdapter
+						.findUserByEmail(email)
+						.then((res) => res?.user);
 
 					if (!user) {
 						if (!options.disableSignUp) {
-							const newUser = await ctx.context.internalAdapter.createUser({
-								email: email,
-								emailVerified: true,
-								name: email,
-							});
-							userId = newUser.id;
-							if (!userId) {
-								throw ctx.redirect(`${toRedirectTo}?error=USER_NOT_CREATED`);
+							const newUser = await ctx.context.internalAdapter.createUser(
+								{
+									email: email,
+									emailVerified: true,
+									name: name || "",
+								},
+								ctx,
+							);
+							user = newUser;
+							if (!user) {
+								throw ctx.redirect(
+									`${toRedirectTo}?error=failed_to_create_user`,
+								);
 							}
 						} else {
-							throw ctx.redirect(`${toRedirectTo}?error=USER_NOT_FOUND`);
+							throw ctx.redirect(
+								`${toRedirectTo}?error=new_user_signup_disabled`,
+							);
 						}
 					}
-					const session = await ctx.context.internalAdapter.createSession(
-						userId,
-						ctx.headers,
-					);
-					if (!session) {
-						throw ctx.redirect(`${toRedirectTo}?error=SESSION_NOT_CREATED`);
+
+					if (!user.emailVerified) {
+						await ctx.context.internalAdapter.updateUser(
+							user.id,
+							{
+								emailVerified: true,
+							},
+							ctx,
+						);
 					}
+
+					const session = await ctx.context.internalAdapter.createSession(
+						user.id,
+						ctx,
+					);
+
+					if (!session) {
+						throw ctx.redirect(
+							`${toRedirectTo}?error=failed_to_create_session`,
+						);
+					}
+
 					await setSessionCookie(ctx, {
 						session,
-						user: user?.user!,
+						user,
 					});
-					if (!callbackURL) {
+					if (!ctx.query.callbackURL) {
 						return ctx.json({
-							status: true,
+							token: session.token,
+							user: {
+								id: user.id,
+								email: user.email,
+								emailVerified: user.emailVerified,
+								name: user.name,
+								image: user.image,
+								createdAt: user.createdAt,
+								updatedAt: user.updatedAt,
+							},
 						});
 					}
 					throw ctx.redirect(callbackURL);

@@ -1,3 +1,4 @@
+// @vitest-environment happy-dom
 import { describe, expect, expectTypeOf, it, vi } from "vitest";
 import { createAuthClient as createSolidClient } from "./solid";
 import { createAuthClient as createReactClient } from "./react";
@@ -7,10 +8,10 @@ import { testClientPlugin, testClientPlugin2 } from "./test-plugin";
 import type { Accessor } from "solid-js";
 import type { Ref } from "vue";
 import type { ReadableAtom } from "nanostores";
-import type { Session } from "../db/schema";
+import type { Session } from "../types";
 import { BetterFetchError } from "@better-fetch/fetch";
-import { passkeyClient, twoFactorClient } from "../plugins";
-import { organizationClient } from "./plugins";
+import { twoFactorClient } from "../plugins";
+import { organizationClient, passkeyClient } from "./plugins";
 
 describe("run time proxy", async () => {
 	it("proxy api should be called", async () => {
@@ -134,10 +135,10 @@ describe("type", () => {
 					name: string;
 					createdAt: Date;
 					updatedAt: Date;
-					image?: string | undefined;
+					image?: string | undefined | null;
 					testField4: string;
-					testField?: string | undefined;
-					testField2?: number | undefined;
+					testField?: string | undefined | null;
+					testField2?: number | undefined | null;
 				};
 				session: Session;
 			} | null;
@@ -230,8 +231,11 @@ describe("type", () => {
 				id: string;
 				userId: string;
 				expiresAt: Date;
-				ipAddress?: string | undefined;
-				userAgent?: string | undefined;
+				token: string;
+				ipAddress?: string | undefined | null;
+				userAgent?: string | undefined | null;
+				createdAt: Date;
+				updatedAt: Date;
 			};
 			user: {
 				id: string;
@@ -240,24 +244,18 @@ describe("type", () => {
 				name: string;
 				createdAt: Date;
 				updatedAt: Date;
-				image?: string | undefined;
+				image?: string | undefined | null;
 				testField4: string;
-				testField?: string | undefined;
-				testField2?: number | undefined;
-				twoFactorEnabled: boolean | undefined;
+				testField?: string | undefined | null;
+				testField2?: number | undefined | null;
+				twoFactorEnabled: boolean | undefined | null;
 			};
 		}>();
 	});
 
 	it("should infer session react", () => {
 		const client = createReactClient({
-			plugins: [
-				organizationClient(),
-				twoFactorClient({
-					twoFactorPage: "/two-factor",
-				}),
-				passkeyClient(),
-			],
+			plugins: [organizationClient(), twoFactorClient(), passkeyClient()],
 		});
 		const $infer = client.$Infer.Session;
 		expectTypeOf($infer.user).toEqualTypeOf<{
@@ -267,8 +265,8 @@ describe("type", () => {
 			emailVerified: boolean;
 			createdAt: Date;
 			updatedAt: Date;
-			image?: string | undefined;
-			twoFactorEnabled: boolean | undefined;
+			image?: string | undefined | null;
+			twoFactorEnabled: boolean | undefined | null;
 		}>();
 	});
 
@@ -293,17 +291,17 @@ describe("type", () => {
 					name: string;
 					createdAt: Date;
 					updatedAt: Date;
-					image?: string | undefined;
+					image?: string | undefined | null;
 					testField4: string;
-					testField?: string | undefined;
-					testField2?: number | undefined;
+					testField?: string | undefined | null;
+					testField2?: number | undefined | null;
 				};
 				session: {
 					id: string;
 					userId: string;
 					expiresAt: Date;
-					ipAddress?: string | undefined;
-					userAgent?: string | undefined;
+					ipAddress?: string | undefined | null;
+					userAgent?: string | undefined | null;
 				};
 			} | null>
 		>();

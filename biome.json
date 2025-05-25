@@ -21,12 +21,16 @@
 			"complexity": {
 				"noUselessSwitchCase": "warn",
 				"noUselessTypeConstraint": "warn"
+			},
+			"correctness": {
+				"noUnusedImports": "warn"
 			}
 		}
 	},
 	"files": {
 		"ignore": [
 			"dist",
+			"build",
 			".next",
 			".svelte-kit",
 			"package.json",
@@ -35,7 +39,8 @@
 			".nuxt",
 			".source",
 			".expo",
-			".cache"
+			".cache",
+			"dev/cloudflare/drizzle"
 		]
 	}
 }

@@ -1,13 +1,21 @@
 import type { BetterAuthPlugin } from "better-auth";
+import { createAuthMiddleware } from "better-auth/api";
 
-export const expo: () => BetterAuthPlugin = () => {
+export interface ExpoOptions {
+	/**
+	 * Override origin header for expo API routes
+	 */
+	overrideOrigin?: boolean;
+}
+
+export const expo = (options?: ExpoOptions) => {
 	return {
 		id: "expo",
 		init: (ctx) => {
 			const trustedOrigins =
 				process.env.NODE_ENV === "development"
-					? [...(ctx.options.trustedOrigins || []), "exp://"]
-					: ctx.options.trustedOrigins;
+					? [...(ctx.trustedOrigins || []), "exp://"]
+					: ctx.trustedOrigins;
 			return {
 				options: {
 					trustedOrigins,
@@ -15,7 +23,7 @@ export const expo: () => BetterAuthPlugin = () => {
 			};
 		},
 		async onRequest(request, ctx) {
-			if (request.headers.get("origin")) {
+			if (!options?.overrideOrigin || request.headers.get("origin")) {
 				return;
 			}
 			/**
@@ -25,48 +33,46 @@ export const expo: () => BetterAuthPlugin = () => {
 			if (!expoOrigin) {
 				return;
 			}
-			request.headers.set("origin", expoOrigin);
+			const req = request.clone();
+			req.headers.set("origin", expoOrigin);
 			return {
-				request,
+				request: req,
 			};
 		},
 		hooks: {
 			after: [
 				{
 					matcher(context) {
-						return context.path?.startsWith("/callback");
+						return (
+							context.path?.startsWith("/callback") ||
+							context.path?.startsWith("/oauth2/callback")
+						);
 					},
-					handler: async (ctx) => {
-						const response = ctx.context.returned as Response;
-						if (response.status === 302) {
-							const location = response.headers.get("location");
-							if (!location) {
-								return;
-							}
-							const trustedOrigins = ctx.context.trustedOrigins.filter(
-								(origin) => !origin.startsWith("http"),
-							);
-							const isTrustedOrigin = trustedOrigins.some((origin) =>
-								location?.startsWith(origin),
-							);
-							if (!isTrustedOrigin) {
-								return;
-							}
-							const cookie = response.headers.get("set-cookie");
-
-							if (!cookie) {
-								return;
-							}
-							const url = new URL(location);
-							url.searchParams.set("cookie", cookie);
-							response.headers.set("location", url.toString());
-							return {
-								response,
-							};
+					handler: createAuthMiddleware(async (ctx) => {
+						const headers = ctx.context.responseHeaders;
+						const location = headers?.get("location");
+						if (!location) {
+							return;
 						}
-					},
+						const trustedOrigins = ctx.context.trustedOrigins.filter(
+							(origin: string) => !origin.startsWith("http"),
+						);
+						const isTrustedOrigin = trustedOrigins.some((origin: string) =>
+							location?.startsWith(origin),
+						);
+						if (!isTrustedOrigin) {
+							return;
+						}
+						const cookie = headers?.get("set-cookie");
+						if (!cookie) {
+							return;
+						}
+						const url = new URL(location);
+						url.searchParams.set("cookie", cookie);
+						ctx.setHeader("location", url.toString());
+					}),
 				},
 			],
 		},
-	};
+	} satisfies BetterAuthPlugin;
 };

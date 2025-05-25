@@ -1,4 +1,4 @@
-import { z, ZodObject, ZodOptional, ZodString } from "zod";
+import { z } from "zod";
 import { createAuthEndpoint } from "../call";
 import { createEmailVerificationToken } from "./email-verification";
 import { setSessionCookie } from "../../cookies";
@@ -6,34 +6,132 @@ import { APIError } from "better-call";
 import type {
 	AdditionalUserFieldsInput,
 	BetterAuthOptions,
-	InferSession,
-	InferUser,
 	User,
 } from "../../types";
-import type { toZod } from "../../types/to-zod";
 import { parseUserInput } from "../../db/schema";
-import { getDate } from "../../utils/date";
-import { logger } from "../../utils";
+import { BASE_ERROR_CODES } from "../../error/codes";
+import { isDevelopment } from "../../utils/env";
 
 export const signUpEmail = <O extends BetterAuthOptions>() =>
 	createAuthEndpoint(
 		"/sign-up/email",
 		{
 			method: "POST",
-			query: z
-				.object({
-					currentURL: z.string().optional(),
-				})
-				.optional(),
-			body: z.record(z.string(), z.any()) as unknown as ZodObject<{
-				name: ZodString;
-				email: ZodString;
-				password: ZodString;
-			}> &
-				toZod<AdditionalUserFieldsInput<O>>,
+			body: z.record(z.string(), z.any()),
+			metadata: {
+				$Infer: {
+					body: {} as {
+						name: string;
+						email: string;
+						password: string;
+						callbackURL?: string;
+					} & AdditionalUserFieldsInput<O>,
+				},
+				openapi: {
+					description: "Sign up a user using email and password",
+					requestBody: {
+						content: {
+							"application/json": {
+								schema: {
+									type: "object",
+									properties: {
+										name: {
+											type: "string",
+											description: "The name of the user",
+										},
+										email: {
+											type: "string",
+											description: "The email of the user",
+										},
+										password: {
+											type: "string",
+											description: "The password of the user",
+										},
+										callbackURL: {
+											type: "string",
+											description:
+												"The URL to use for email verification callback",
+										},
+									},
+									required: ["name", "email", "password"],
+								},
+							},
+						},
+					},
+					responses: {
+						"200": {
+							description: "Successfully created user",
+							content: {
+								"application/json": {
+									schema: {
+										type: "object",
+										properties: {
+											token: {
+												type: "string",
+												nullable: true,
+												description: "Authentication token for the session",
+											},
+											user: {
+												type: "object",
+												properties: {
+													id: {
+														type: "string",
+														description: "The unique identifier of the user",
+													},
+													email: {
+														type: "string",
+														format: "email",
+														description: "The email address of the user",
+													},
+													name: {
+														type: "string",
+														description: "The name of the user",
+													},
+													image: {
+														type: "string",
+														format: "uri",
+														nullable: true,
+														description: "The profile image URL of the user",
+													},
+													emailVerified: {
+														type: "boolean",
+														description: "Whether the email has been verified",
+													},
+													createdAt: {
+														type: "string",
+														format: "date-time",
+														description: "When the user was created",
+													},
+													updatedAt: {
+														type: "string",
+														format: "date-time",
+														description: "When the user was last updated",
+													},
+												},
+												required: [
+													"id",
+													"email",
+													"name",
+													"emailVerified",
+													"createdAt",
+													"updatedAt",
+												],
+											},
+										},
+										required: ["user"], // token is optional
+									},
+								},
+							},
+						},
+					},
+				},
+			},
 		},
 		async (ctx) => {
-			if (!ctx.context.options.emailAndPassword?.enabled) {
+			if (
+				!ctx.context.options.emailAndPassword?.enabled ||
+				ctx.context.options.emailAndPassword?.disableSignUp
+			) {
 				throw new APIError("BAD_REQUEST", {
 					message: "Email and password sign up is not enabled",
 				});
@@ -50,7 +148,7 @@ export const signUpEmail = <O extends BetterAuthOptions>() =>
 
 			if (!isValidEmail.success) {
 				throw new APIError("BAD_REQUEST", {
-					message: "Invalid email",
+					message: BASE_ERROR_CODES.INVALID_EMAIL,
 				});
 			}
 
@@ -58,7 +156,7 @@ export const signUpEmail = <O extends BetterAuthOptions>() =>
 			if (password.length < minPasswordLength) {
 				ctx.context.logger.error("Password is too short");
 				throw new APIError("BAD_REQUEST", {
-					message: "Password is too short",
+					message: BASE_ERROR_CODES.PASSWORD_TOO_SHORT,
 				});
 			}
 
@@ -66,14 +164,14 @@ export const signUpEmail = <O extends BetterAuthOptions>() =>
 			if (password.length > maxPasswordLength) {
 				ctx.context.logger.error("Password is too long");
 				throw new APIError("BAD_REQUEST", {
-					message: "Password is too long",
+					message: BASE_ERROR_CODES.PASSWORD_TOO_LONG,
 				});
 			}
 			const dbUser = await ctx.context.internalAdapter.findUserByEmail(email);
 			if (dbUser?.user) {
 				ctx.context.logger.info(`Sign-up attempt for existing email: ${email}`);
 				throw new APIError("UNPROCESSABLE_ENTITY", {
-					message: "User with this email already exists",
+					message: BASE_ERROR_CODES.USER_ALREADY_EXISTS,
 				});
 			}
 
@@ -81,53 +179,71 @@ export const signUpEmail = <O extends BetterAuthOptions>() =>
 				ctx.context.options,
 				additionalFields as any,
 			);
+			/**
+			 * Hash the password
+			 *
+			 * This is done prior to creating the user
+			 * to ensure that any plugin that
+			 * may break the hashing should break
+			 * before the user is created.
+			 */
+			const hash = await ctx.context.password.hash(password);
 			let createdUser: User;
 			try {
-				createdUser = await ctx.context.internalAdapter.createUser({
-					email: email.toLowerCase(),
-					name,
-					image,
-					...additionalData,
-					emailVerified: false,
-				});
+				createdUser = await ctx.context.internalAdapter.createUser(
+					{
+						email: email.toLowerCase(),
+						name,
+						image,
+						...additionalData,
+						emailVerified: false,
+					},
+					ctx,
+				);
 				if (!createdUser) {
 					throw new APIError("BAD_REQUEST", {
-						message: "Failed to create user",
+						message: BASE_ERROR_CODES.FAILED_TO_CREATE_USER,
 					});
 				}
 			} catch (e) {
-				logger.error("Failed to create user", e);
+				if (isDevelopment) {
+					ctx.context.logger.error("Failed to create user", e);
+				}
+				if (e instanceof APIError) {
+					throw e;
+				}
 				throw new APIError("UNPROCESSABLE_ENTITY", {
-					message: "Failed to create user",
+					message: BASE_ERROR_CODES.FAILED_TO_CREATE_USER,
 					details: e,
 				});
 			}
 			if (!createdUser) {
 				throw new APIError("UNPROCESSABLE_ENTITY", {
-					message: "Failed to create user",
+					message: BASE_ERROR_CODES.FAILED_TO_CREATE_USER,
 				});
 			}
-			/**
-			 * Link the account to the user
-			 */
-			const hash = await ctx.context.password.hash(password);
-			await ctx.context.internalAdapter.linkAccount({
-				userId: createdUser.id,
-				providerId: "credential",
-				accountId: createdUser.id,
-				password: hash,
-				expiresAt: getDate(60 * 60 * 24 * 30, "sec"),
-			});
-			if (ctx.context.options.emailVerification?.sendOnSignUp) {
+			await ctx.context.internalAdapter.linkAccount(
+				{
+					userId: createdUser.id,
+					providerId: "credential",
+					accountId: createdUser.id,
+					password: hash,
+				},
+				ctx,
+			);
+			if (
+				ctx.context.options.emailVerification?.sendOnSignUp ||
+				ctx.context.options.emailAndPassword.requireEmailVerification
+			) {
 				const token = await createEmailVerificationToken(
 					ctx.context.secret,
 					createdUser.email,
+					undefined,
+					ctx.context.options.emailVerification?.expiresIn,
 				);
 				const url = `${
 					ctx.context.baseURL
-				}/verify-email?token=${token}&callbackURL=${
-					body.callbackURL || ctx.query?.currentURL || "/"
-				}`;
+				}/verify-email?token=${token}&callbackURL=${body.callbackURL || "/"}`;
 				await ctx.context.options.emailVerification?.sendVerificationEmail?.(
 					{
 						user: createdUser,
@@ -139,35 +255,30 @@ export const signUpEmail = <O extends BetterAuthOptions>() =>
 			}
 
 			if (
-				!ctx.context.options.emailAndPassword.autoSignIn ||
+				ctx.context.options.emailAndPassword.autoSignIn === false ||
 				ctx.context.options.emailAndPassword.requireEmailVerification
 			) {
-				return ctx.json(
-					{
-						user: createdUser as InferUser<O>,
-						session: null,
+				return ctx.json({
+					token: null,
+					user: {
+						id: createdUser.id,
+						email: createdUser.email,
+						name: createdUser.name,
+						image: createdUser.image,
+						emailVerified: createdUser.emailVerified,
+						createdAt: createdUser.createdAt,
+						updatedAt: createdUser.updatedAt,
 					},
-					{
-						body: body.callbackURL
-							? {
-									url: body.callbackURL,
-									redirect: true,
-								}
-							: {
-									user: createdUser,
-									session: null,
-								},
-					},
-				);
+				});
 			}
 
 			const session = await ctx.context.internalAdapter.createSession(
 				createdUser.id,
-				ctx.request,
+				ctx,
 			);
 			if (!session) {
 				throw new APIError("BAD_REQUEST", {
-					message: "Failed to create session",
+					message: BASE_ERROR_CODES.FAILED_TO_CREATE_SESSION,
 				});
 			}
 			await setSessionCookie(ctx, {
@@ -175,8 +286,16 @@ export const signUpEmail = <O extends BetterAuthOptions>() =>
 				user: createdUser,
 			});
 			return ctx.json({
-				user: createdUser as InferUser<O>,
-				session: session as InferSession<O>,
+				token: session.token,
+				user: {
+					id: createdUser.id,
+					email: createdUser.email,
+					name: createdUser.name,
+					image: createdUser.image,
+					emailVerified: createdUser.emailVerified,
+					createdAt: createdUser.createdAt,
+					updatedAt: createdUser.updatedAt,
+				},
 			});
 		},
 	);

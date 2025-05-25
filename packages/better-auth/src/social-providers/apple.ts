@@ -1,10 +1,12 @@
-import type { OAuthProvider, ProviderOptions } from "../oauth2";
-import { parseJWT } from "oslo/jwt";
-import { validateAuthorizationCode } from "../oauth2";
-import { decodeProtectedHeader, importJWK, jwtVerify } from "jose";
 import { betterFetch } from "@better-fetch/fetch";
 import { APIError } from "better-call";
-import { z } from "zod";
+import { decodeJwt, decodeProtectedHeader, importJWK, jwtVerify } from "jose";
+import type { OAuthProvider, ProviderOptions } from "../oauth2";
+import {
+	refreshAccessToken,
+	createAuthorizationURL,
+	validateAuthorizationCode,
+} from "../oauth2";
 export interface AppleProfile {
 	/**
 	 * The subject registered claim identifies the principal that’s the subject
@@ -50,31 +52,51 @@ export interface AppleProfile {
 	 * The URL to the user's profile picture.
 	 */
 	picture: string;
+	user?: AppleNonConformUser;
 }
 
-export interface AppleOptions extends ProviderOptions {}
+/**
+ * This is the shape of the `user` query parameter that Apple sends the first
+ * time the user consents to the app.
+ * @see https://developer.apple.com/documentation/signinwithapplerestapi/request-an-authorization-to-the-sign-in-with-apple-server./
+ */
+export interface AppleNonConformUser {
+	name: {
+		firstName: string;
+		lastName: string;
+	};
+	email: string;
+}
+
+export interface AppleOptions extends ProviderOptions<AppleProfile> {
+	appBundleIdentifier?: string;
+}
 
 export const apple = (options: AppleOptions) => {
 	const tokenEndpoint = "https://appleid.apple.com/auth/token";
 	return {
 		id: "apple",
 		name: "Apple",
-		createAuthorizationURL({ state, scopes, redirectURI }) {
-			const _scope = scopes || ["email", "name", "openid"];
+		async createAuthorizationURL({ state, scopes, redirectURI }) {
+			const _scope = options.disableDefaultScope ? [] : ["email", "name"];
 			options.scope && _scope.push(...options.scope);
-			return new URL(
-				`https://appleid.apple.com/auth/authorize?client_id=${
-					options.clientId
-				}&response_type=code&redirect_uri=${
-					redirectURI || options.redirectURI
-				}&scope=${_scope.join(" ")}&state=${state}`,
-			);
+			scopes && _scope.push(...scopes);
+			const url = await createAuthorizationURL({
+				id: "apple",
+				options,
+				authorizationEndpoint: "https://appleid.apple.com/auth/authorize",
+				scopes: _scope,
+				state,
+				redirectURI,
+				responseMode: "form_post",
+			});
+			return url;
 		},
 		validateAuthorizationCode: async ({ code, codeVerifier, redirectURI }) => {
 			return validateAuthorizationCode({
 				code,
 				codeVerifier,
-				redirectURI: options.redirectURI || redirectURI,
+				redirectURI,
 				options,
 				tokenEndpoint,
 			});
@@ -93,7 +115,7 @@ export const apple = (options: AppleOptions) => {
 			const { payload: jwtClaims } = await jwtVerify(token, publicKey, {
 				algorithms: [jwtAlg],
 				issuer: "https://appleid.apple.com",
-				audience: options.clientId,
+				audience: options.appBundleIdentifier || options.clientId,
 				maxTokenAge: "1h",
 			});
 			["email_verified", "is_private_email"].forEach((field) => {
@@ -106,25 +128,50 @@ export const apple = (options: AppleOptions) => {
 			}
 			return !!jwtClaims;
 		},
+		refreshAccessToken: options.refreshAccessToken
+			? options.refreshAccessToken
+			: async (refreshToken) => {
+					return refreshAccessToken({
+						refreshToken,
+						options: {
+							clientId: options.clientId,
+							clientKey: options.clientKey,
+							clientSecret: options.clientSecret,
+						},
+						tokenEndpoint: "https://appleid.apple.com/auth/token",
+					});
+				},
 		async getUserInfo(token) {
+			if (options.getUserInfo) {
+				return options.getUserInfo(token);
+			}
 			if (!token.idToken) {
 				return null;
 			}
-			const data = parseJWT(token.idToken)?.payload as AppleProfile | null;
-			if (!data) {
+			const profile = decodeJwt<AppleProfile>(token.idToken);
+			if (!profile) {
 				return null;
 			}
+			const name = token.user
+				? `${token.user.name?.firstName} ${token.user.name?.lastName}`
+				: profile.name || profile.email;
+			const emailVerified =
+				typeof profile.email_verified === "boolean"
+					? profile.email_verified
+					: profile.email_verified === "true";
+			const userMap = await options.mapProfileToUser?.(profile);
 			return {
 				user: {
-					id: data.sub,
-					name: data.name,
-					email: data.email,
-					emailVerified: data.email_verified === "true",
-					image: data.picture,
+					id: profile.sub,
+					name: name,
+					emailVerified: emailVerified,
+					email: profile.email,
+					...userMap,
 				},
-				data,
+				data: profile,
 			};
 		},
+		options,
 	} satisfies OAuthProvider<AppleProfile>;
 };
 

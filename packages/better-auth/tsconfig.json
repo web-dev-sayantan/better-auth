@@ -7,14 +7,20 @@
 		"resolveJsonModule": true,
 		"module": "Preserve",
 		"noEmit": true,
+
 		"moduleResolution": "Bundler",
 		"moduleDetection": "force",
 		"isolatedModules": true,
 		"verbatimModuleSyntax": true,
+		"composite": false,
+		"incremental": true,
+		"tsBuildInfoFile": ".tsbuildinfo",
 		"strict": true,
 		"noImplicitOverride": true,
-		"noFallthroughCasesInSwitch": true
+		"noFallthroughCasesInSwitch": true,
+		"downlevelIteration": true
 	},
-	"exclude": ["node_modules"],
+	"exclude": ["**/dist", "node_modules"],
+	"references": [],
 	"include": ["src"]
 }

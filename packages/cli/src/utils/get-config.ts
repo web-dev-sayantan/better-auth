@@ -3,19 +3,27 @@ import type { BetterAuthOptions } from "better-auth";
 import { logger } from "better-auth";
 import path from "path";
 // @ts-ignore
-import babelPresetTypescript from "@babel/preset-typescript";
+import babelPresetTypeScript from "@babel/preset-typescript";
 // @ts-ignore
 import babelPresetReact from "@babel/preset-react";
-import fs from "fs";
+import fs, { existsSync } from "fs";
 import { BetterAuthError } from "better-auth";
 import { addSvelteKitEnvModules } from "./add-svelte-kit-env-modules";
-import D from "path";
+import { getTsconfigInfo } from "./get-tsconfig-info";
 
-let possiblePaths = ["auth.ts", "auth.tsx"];
+let possiblePaths = [
+	"auth.ts",
+	"auth.tsx",
+	"auth.js",
+	"auth.jsx",
+	"auth.server.js",
+	"auth.server.ts",
+];
 
 possiblePaths = [
 	...possiblePaths,
-	...possiblePaths.map((it) => `lib/server${it}`),
+	...possiblePaths.map((it) => `lib/server/${it}`),
+	...possiblePaths.map((it) => `server/${it}`),
 	...possiblePaths.map((it) => `lib/${it}`),
 	...possiblePaths.map((it) => `utils/${it}`),
 ];
@@ -25,25 +33,14 @@ possiblePaths = [
 	...possiblePaths.map((it) => `app/${it}`),
 ];
 
-function stripJsonComments(jsonString: string): string {
-	return jsonString.replace(
-		/\\"|"(?:\\"|[^"])*"|(\/\/.*|\/\*[\s\S]*?\*\/)/g,
-		(m, g) => (g ? "" : m),
-	);
-}
-
 function getPathAliases(cwd: string): Record<string, string> | null {
 	const tsConfigPath = path.join(cwd, "tsconfig.json");
 	if (!fs.existsSync(tsConfigPath)) {
-		logger.warn("[#better-auth]: tsconfig.json not found.");
 		return null;
 	}
 	try {
-		const tsConfigContent = fs.readFileSync(tsConfigPath, "utf8");
-		const strippedTsConfigContent = stripJsonComments(tsConfigContent);
-		const tsConfig = JSON.parse(strippedTsConfigContent);
+		const tsConfig = getTsconfigInfo(cwd);
 		const { paths = {}, baseUrl = "." } = tsConfig.compilerOptions || {};
-
 		const result: Record<string, string> = {};
 		const obj = Object.entries(paths) as [string, string[]][];
 		for (const [alias, aliasPaths] of obj) {
@@ -75,7 +72,7 @@ const jitiOptions = (cwd: string) => {
 			babel: {
 				presets: [
 					[
-						babelPresetTypescript,
+						babelPresetTypeScript,
 						{
 							isTSX: true,
 							allExtensions: true,
@@ -92,13 +89,17 @@ const jitiOptions = (cwd: string) => {
 export async function getConfig({
 	cwd,
 	configPath,
+	shouldThrowOnError = false,
 }: {
 	cwd: string;
 	configPath?: string;
+	shouldThrowOnError?: boolean;
 }) {
 	try {
 		let configFile: BetterAuthOptions | null = null;
 		if (configPath) {
+			let resolvedPath: string = path.join(cwd, configPath);
+			if (existsSync(configPath)) resolvedPath = configPath; // If the configPath is a file, use it as is, as it means the path wasn't relative.
 			const { config } = await loadConfig<{
 				auth: {
 					options: BetterAuthOptions;
@@ -107,13 +108,18 @@ export async function getConfig({
 					options: BetterAuthOptions;
 				};
 			}>({
-				configFile: path.join(cwd, configPath),
+				configFile: resolvedPath,
 				dotenv: true,
 				jitiOptions: jitiOptions(cwd),
 			});
 			if (!config.auth && !config.default) {
+				if (shouldThrowOnError) {
+					throw new Error(
+						`Couldn't read your auth config in ${resolvedPath}. Make sure to default export your auth instance or to export as a variable named auth.`,
+					);
+				}
 				logger.error(
-					"[#better-auth]: Couldn't read your auth config. Make sure to default export your auth instance or to export as a variable named auth.",
+					`[#better-auth]: Couldn't read your auth config in ${resolvedPath}. Make sure to default export your auth instance or to export as a variable named auth.`,
 				);
 				process.exit(1);
 			}
@@ -139,8 +145,13 @@ export async function getConfig({
 						configFile =
 							config.auth?.options || config.default?.options || null;
 						if (!configFile) {
+							if (shouldThrowOnError) {
+								throw new Error(
+									"Couldn't read your auth config. Make sure to default export your auth instance or to export as a variable named auth.",
+								);
+							}
 							logger.error("[#better-auth]: Couldn't read your auth config.");
-							logger.break();
+							console.log("");
 							logger.info(
 								"[#better-auth]: Make sure to default export your auth instance or to export as a variable named auth.",
 							);
@@ -149,6 +160,28 @@ export async function getConfig({
 						break;
 					}
 				} catch (e) {
+					if (
+						typeof e === "object" &&
+						e &&
+						"message" in e &&
+						typeof e.message === "string" &&
+						e.message.includes(
+							"This module cannot be imported from a Client Component module",
+						)
+					) {
+						if (shouldThrowOnError) {
+							throw new Error(
+								`Please remove import 'server-only' from your auth config file temporarily. The CLI cannot resolve the configuration with it included. You can re-add it after running the CLI.`,
+							);
+						}
+						logger.error(
+							`Please remove import 'server-only' from your auth config file temporarily. The CLI cannot resolve the configuration with it included. You can re-add it after running the CLI.`,
+						);
+						process.exit(1);
+					}
+					if (shouldThrowOnError) {
+						throw e;
+					}
 					logger.error("[#better-auth]: Couldn't read your auth config.", e);
 					process.exit(1);
 				}
@@ -156,7 +189,30 @@ export async function getConfig({
 		}
 		return configFile;
 	} catch (e) {
-		logger.error("Couldn't read your auth config.");
+		if (
+			typeof e === "object" &&
+			e &&
+			"message" in e &&
+			typeof e.message === "string" &&
+			e.message.includes(
+				"This module cannot be imported from a Client Component module",
+			)
+		) {
+			if (shouldThrowOnError) {
+				throw new Error(
+					`Please remove import 'server-only' from your auth config file temporarily. The CLI cannot resolve the configuration with it included. You can re-add it after running the CLI.`,
+				);
+			}
+			logger.error(
+				`Please remove import 'server-only' from your auth config file temporarily. The CLI cannot resolve the configuration with it included. You can re-add it after running the CLI.`,
+			);
+			process.exit(1);
+		}
+		if (shouldThrowOnError) {
+			throw e;
+		}
+
+		logger.error("Couldn't read your auth config.", e);
 		process.exit(1);
 	}
 }

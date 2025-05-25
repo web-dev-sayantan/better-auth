@@ -1,6 +1,10 @@
 import { betterFetch } from "@better-fetch/fetch";
 import type { OAuthProvider, ProviderOptions } from "../oauth2";
-import { createAuthorizationURL, validateAuthorizationCode } from "../oauth2";
+import {
+	createAuthorizationURL,
+	validateAuthorizationCode,
+	refreshAccessToken,
+} from "../oauth2";
 
 export interface GitlabProfile extends Record<string, any> {
 	id: number;
@@ -47,7 +51,7 @@ export interface GitlabProfile extends Record<string, any> {
 	extra_shared_runners_minutes_limit: number;
 }
 
-export interface GitlabOptions extends ProviderOptions {
+export interface GitlabOptions extends ProviderOptions<GitlabProfile> {
 	issuer?: string;
 }
 
@@ -79,10 +83,12 @@ export const gitlab = (options: GitlabOptions) => {
 			state,
 			scopes,
 			codeVerifier,
+			loginHint,
 			redirectURI,
 		}) => {
-			const _scopes = scopes || ["read_user"];
+			const _scopes = options.disableDefaultScope ? [] : ["read_user"];
 			options.scope && _scopes.push(...options.scope);
+			scopes && _scopes.push(...scopes);
 			return await createAuthorizationURL({
 				id: issuerId,
 				options,
@@ -91,18 +97,35 @@ export const gitlab = (options: GitlabOptions) => {
 				state,
 				redirectURI,
 				codeVerifier,
+				loginHint,
 			});
 		},
 		validateAuthorizationCode: async ({ code, redirectURI, codeVerifier }) => {
 			return validateAuthorizationCode({
 				code,
-				redirectURI: options.redirectURI || redirectURI,
+				redirectURI,
 				options,
 				codeVerifier,
 				tokenEndpoint,
 			});
 		},
+		refreshAccessToken: options.refreshAccessToken
+			? options.refreshAccessToken
+			: async (refreshToken) => {
+					return refreshAccessToken({
+						refreshToken,
+						options: {
+							clientId: options.clientId,
+							clientKey: options.clientKey,
+							clientSecret: options.clientSecret,
+						},
+						tokenEndpoint: "https://gitlab.com/oauth/token",
+					});
+				},
 		async getUserInfo(token) {
+			if (options.getUserInfo) {
+				return options.getUserInfo(token);
+			}
 			const { data: profile, error } = await betterFetch<GitlabProfile>(
 				userinfoEndpoint,
 				{ headers: { authorization: `Bearer ${token.accessToken}` } },
@@ -110,6 +133,7 @@ export const gitlab = (options: GitlabOptions) => {
 			if (error || profile.state !== "active" || profile.locked) {
 				return null;
 			}
+			const userMap = await options.mapProfileToUser?.(profile);
 			return {
 				user: {
 					id: profile.id.toString(),
@@ -117,9 +141,11 @@ export const gitlab = (options: GitlabOptions) => {
 					email: profile.email,
 					image: profile.avatar_url,
 					emailVerified: true,
+					...userMap,
 				},
 				data: profile,
 			};
 		},
+		options,
 	} satisfies OAuthProvider<GitlabProfile>;
 };

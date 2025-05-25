@@ -1,8 +1,11 @@
-import { betterFetch } from "@better-fetch/fetch";
 import type { OAuthProvider, ProviderOptions } from "../oauth2";
 import { logger } from "../utils";
-import { parseJWT } from "oslo/jwt";
-import { createAuthorizationURL, validateAuthorizationCode } from "../oauth2";
+import {
+	createAuthorizationURL,
+	validateAuthorizationCode,
+	refreshAccessToken,
+} from "../oauth2";
+import { decodeJwt } from "jose";
 
 export interface TwitchProfile {
 	/**
@@ -23,7 +26,7 @@ export interface TwitchProfile {
 	picture: string;
 }
 
-export interface TwitchOptions extends ProviderOptions {
+export interface TwitchOptions extends ProviderOptions<TwitchProfile> {
 	claims?: string[];
 }
 export const twitch = (options: TwitchOptions) => {
@@ -31,8 +34,11 @@ export const twitch = (options: TwitchOptions) => {
 		id: "twitch",
 		name: "Twitch",
 		createAuthorizationURL({ state, scopes, redirectURI }) {
-			const _scopes = scopes || ["user:read:email", "openid"];
+			const _scopes = options.disableDefaultScope
+				? []
+				: ["user:read:email", "openid"];
 			options.scope && _scopes.push(...options.scope);
+			scopes && _scopes.push(...scopes);
 			return createAuthorizationURL({
 				id: "twitch",
 				redirectURI,
@@ -51,18 +57,35 @@ export const twitch = (options: TwitchOptions) => {
 		validateAuthorizationCode: async ({ code, redirectURI }) => {
 			return validateAuthorizationCode({
 				code,
-				redirectURI: options.redirectURI || redirectURI,
+				redirectURI,
 				options,
 				tokenEndpoint: "https://id.twitch.tv/oauth2/token",
 			});
 		},
+		refreshAccessToken: options.refreshAccessToken
+			? options.refreshAccessToken
+			: async (refreshToken) => {
+					return refreshAccessToken({
+						refreshToken,
+						options: {
+							clientId: options.clientId,
+							clientKey: options.clientKey,
+							clientSecret: options.clientSecret,
+						},
+						tokenEndpoint: "https://id.twitch.tv/oauth2/token",
+					});
+				},
 		async getUserInfo(token) {
+			if (options.getUserInfo) {
+				return options.getUserInfo(token);
+			}
 			const idToken = token.idToken;
 			if (!idToken) {
 				logger.error("No idToken found in token");
 				return null;
 			}
-			const profile = parseJWT(idToken)?.payload as TwitchProfile;
+			const profile = decodeJwt(idToken) as TwitchProfile;
+			const userMap = await options.mapProfileToUser?.(profile);
 			return {
 				user: {
 					id: profile.sub,
@@ -70,9 +93,11 @@ export const twitch = (options: TwitchOptions) => {
 					email: profile.email,
 					image: profile.picture,
 					emailVerified: false,
+					...userMap,
 				},
 				data: profile,
 			};
 		},
+		options,
 	} satisfies OAuthProvider<TwitchProfile>;
 };

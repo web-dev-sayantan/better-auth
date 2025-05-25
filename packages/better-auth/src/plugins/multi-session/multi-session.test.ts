@@ -5,7 +5,7 @@ import { multiSessionClient } from "./client";
 import { parseSetCookieHeader } from "../../cookies";
 
 describe("multi-session", async () => {
-	const { auth, client, signInWithTestUser, testUser } = await getTestInstance(
+	const { client, testUser, cookieSetter } = await getTestInstance(
 		{
 			plugins: [
 				multiSession({
@@ -18,7 +18,6 @@ describe("multi-session", async () => {
 				plugins: [multiSessionClient()],
 			},
 		},
-		"postgres",
 	);
 
 	let headers = new Headers();
@@ -42,24 +41,18 @@ describe("multi-session", async () => {
 						.get("better-auth.session_token")
 						?.value.split(".")[0];
 					const multiSession = setCookies.get(
-						`better-auth.session_token_multi-${sessionToken}`,
+						`better-auth.session_token_multi-${sessionToken?.toLowerCase()}`,
 					)?.value;
 					expect(sessionToken).not.toBe(null);
 					expect(multiSession).not.toBe(null);
 					expect(multiSession).toContain(sessionToken);
 					expect(setCookieString).toContain("better-auth.session_token_multi-");
-					headers.set("cookie", `${setCookieString?.split(",").join(";")}`);
 				},
+				onSuccess: cookieSetter(headers),
 			},
 		);
 		await client.signUp.email(testUser2, {
-			onSuccess(context) {
-				const setCookieString = context.response.headers.get("set-cookie");
-				headers.set(
-					"cookie",
-					`${headers.get("cookie")}; ${setCookieString?.split(",").join(";")}`,
-				);
-			},
+			onSuccess: cookieSetter(headers),
 		});
 	});
 
@@ -72,7 +65,7 @@ describe("multi-session", async () => {
 		expect(session.data?.user.email).toBe(testUser2.email);
 	});
 
-	let sessionId = "";
+	let sessionToken = "";
 	it("should list all device sessions", async () => {
 		const res = await client.multiSession.listDeviceSessions({
 			fetchOptions: {
@@ -80,15 +73,16 @@ describe("multi-session", async () => {
 			},
 		});
 		if (res.data) {
-			sessionId =
-				res.data.find((s) => s.user.email === testUser.email)?.session.id || "";
+			sessionToken =
+				res.data.find((s) => s.user.email === testUser.email)?.session.token ||
+				"";
 		}
 		expect(res.data).toHaveLength(2);
 	});
 
 	it("should set active session", async () => {
 		const res = await client.multiSession.setActive({
-			sessionId,
+			sessionToken,
 			fetchOptions: {
 				headers,
 			},
@@ -96,33 +90,62 @@ describe("multi-session", async () => {
 		expect(res.data?.user.email).toBe(testUser.email);
 	});
 
-	it("should sign-out a session", async () => {
-		await client.multiSession.revoke({
-			fetchOptions: {
+	it("should revoke a session and set the next active", async () => {
+		const testUser3 = {
+			email: "my-email@email.com",
+			password: "password",
+			name: "Name",
+		};
+		let token = "";
+		const signUpRes = await client.signUp.email(testUser3, {
+			onSuccess: (ctx) => {
+				const header = ctx.response.headers.get("set-cookie");
+				expect(header).toContain("better-auth.session_token");
+				const cookies = parseSetCookieHeader(header || "");
+				token =
+					cookies.get("better-auth.session_token")?.value.split(".")[0] || "";
+			},
+		});
+		await client.multiSession.revoke(
+			{
+				sessionToken: token,
+			},
+			{
+				onSuccess(context) {
+					expect(context.response.headers.get("set-cookie")).toContain(
+						`better-auth.session_token=`,
+					);
+				},
 				headers,
 			},
-			sessionId,
-		});
+		);
 		const res = await client.multiSession.listDeviceSessions({
 			fetchOptions: {
 				headers,
 			},
 		});
-		expect(res.data).toHaveLength(1);
+		expect(res.data).toHaveLength(2);
 	});
 
 	it("should sign-out all sessions", async () => {
+		const newHeaders = new Headers();
 		await client.signOut({
 			fetchOptions: {
 				headers,
+				onSuccess: cookieSetter(newHeaders),
 			},
 		});
-
 		const res = await client.multiSession.listDeviceSessions({
 			fetchOptions: {
 				headers,
 			},
 		});
 		expect(res.data).toHaveLength(0);
+		const res2 = await client.multiSession.listDeviceSessions({
+			fetchOptions: {
+				headers: newHeaders,
+			},
+		});
+		expect(res2.data).toHaveLength(0);
 	});
 });
